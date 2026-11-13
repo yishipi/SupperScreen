@@ -91,3 +91,7 @@ Windows 数据位于当前用户 `%LOCALAPPDATA%/MagicCompanion`。待办、允�
 `src/core` 为协议、配对、SQLite 和服务；`src/windows` 为 WPF/Windows 平台；`src/android` 为 Kotlin/Compose 客户端；`shared/protocol` 为 JSON Schema 和两端共用的签名向量；`tests` 为真实存储、TLS 集成、受控任务和真实命令行验证；`docs` 为需求及验收记录。
 
 快捷脚本只在电脑配置。快捷脚本使用固定程序、参数数组、工作目录、超时和允许参数模式；另提供独立授权的 PowerShell 终端。任务输出只作为受控状态数据保留有限内容，不写诊断日志。示例及协议见 [docs/PROTOCOL-IMPLEMENTED.md](docs/PROTOCOL-IMPLEMENTED.md)。
+
+## 许可证
+
+项目采用 [MIT 许可证](LICENSE)。随附的 [xterm.js](src/android/app/src/main/assets/terminal/LICENSE-xterm) 和 [xterm.js Fit 插件](src/android/app/src/main/assets/terminal/LICENSE-addon-fit) 保留各自的许可证和版权声明。
