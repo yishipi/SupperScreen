@@ -17,7 +17,7 @@ Windows 电脑控制台与 Android 手机工作台。两端同步待办，手机
 
 ## 运行
 
-在仓库的 [Actions](../../actions) 打开最近一次成功的构建，下载 `windows-x64` 和 `android-debug`，也可以按下方步骤在本地构建。
+在仓库的 [Actions](https://github.com/yishipi/SupperScreen/actions) 打开最近一次成功的构建，下载 `windows-x64` 和 `android-debug`，也可以按下方步骤在本地构建。
 
 1. 退出旧版控制台。解压 `artifacts/SupperScreen-0.21.0-win-x64.zip`，运行其中的 `SupperScreen.exe`。保留整个目录。
 2. 在手机安装 `artifacts/android/SupperScreen-0.21.0-debug.apk`。用相同签名覆盖安装可保留现有配对和配置。

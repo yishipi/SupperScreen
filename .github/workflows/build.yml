@@ -25,8 +25,10 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - uses: android-actions/setup-android@v3
-      - run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+      - uses: android-actions/setup-android@v4.0.3
+        with:
+          packages: 'platforms;android-36 build-tools;36.0.0'
+          log-accepted-android-sdk-licenses: false
       - run: bash gradlew :app:assembleDebug :app:testDebugUnitTest :app:lintDebug --console=plain
         working-directory: src/android
       - uses: actions/upload-artifact@v4
