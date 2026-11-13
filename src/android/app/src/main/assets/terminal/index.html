@@ -1,0 +1,73 @@
+<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; font-src 'none'; connect-src 'none'; img-src 'none'">
+<style>__CSS__
+html,body{margin:0;background:#0c0c0c;overflow:hidden}#terminal{position:fixed;inset:0;overflow:hidden;touch-action:none}.xterm{padding:2px;box-sizing:border-box}</style></head><body><div id="terminal"></div>
+<script>__XTERM__</script><script>__FIT__</script><script>
+const terminal=new Terminal({fontSize:13,fontFamily:'monospace',cursorBlink:true,scrollback:2000,convertEol:false,
+ theme:{background:'#0C0C0C',foreground:'#CCCCCC',cursor:'#FFFFFF',selectionBackground:'#264F78',black:'#0C0C0C',red:'#C50F1F',green:'#13A10E',yellow:'#C19C00',blue:'#0037DA',magenta:'#881798',cyan:'#3A96DD',white:'#CCCCCC',brightBlack:'#767676',brightRed:'#E74856',brightGreen:'#16C60C',brightYellow:'#F9F1A5',brightBlue:'#3B78FF',brightMagenta:'#B4009E',brightCyan:'#61D6D6',brightWhite:'#F2F2F2'}});
+const host=document.getElementById('terminal');
+const fit=new FitAddon.FitAddon();terminal.loadAddon(fit);terminal.open(host);
+terminal.onData(data=>SupperTerminal.send(data));
+let timer,visibleRows=0;
+function cellHeight(){
+ const screen=terminal.element.querySelector('.xterm-screen');
+ return screen.clientHeight/terminal.rows;
+}
+function positionViewport(){
+ const {viewportY,baseY,cursorY}=terminal.buffer.active;
+ const clippedRows=viewportY<baseY?0:Math.max(0,Math.min(terminal.rows-visibleRows,cursorY-visibleRows+1));
+ terminal.element.style.transform=clippedRows?'translateY(-'+(clippedRows*cellHeight())+'px)':'';
+}
+function updateSize(){
+ const size=fit.proposeDimensions();
+ if(!size||!host.clientHeight)return;
+ visibleRows=size.rows;
+ terminal.resize(Math.max(20,size.cols),Math.max(5,size.rows));
+ positionViewport();
+ SupperTerminal.size(terminal.cols,terminal.rows);
+}
+terminal.onRender(positionViewport);
+terminal.onCursorMove(positionViewport);
+terminal.onScroll(positionViewport);
+new ResizeObserver(()=>{clearTimeout(timer);timer=setTimeout(updateSize,100)}).observe(host);
+requestAnimationFrame(updateSize);
+
+// Android WebView can consume the swipe before the terminal's inner viewport sees it.
+let touchY=null,dragPixels=0;
+host.addEventListener('touchstart',event=>{
+ touchY=event.touches.length===1?event.touches[0].clientY:null;
+ dragPixels=0;
+},{capture:true,passive:true});
+host.addEventListener('touchmove',event=>{
+ if(touchY===null||event.touches.length!==1)return;
+ const y=event.touches[0].clientY;
+ dragPixels+=touchY-y;
+ touchY=y;
+ const rowHeight=cellHeight();
+ if(!rowHeight)return;
+ event.preventDefault();
+ event.stopPropagation();
+ const lines=Math.trunc(dragPixels/rowHeight);
+ if(lines){
+  terminal.scrollLines(lines);
+  dragPixels-=lines*rowHeight;
+ }
+},{capture:true,passive:false});
+function endTouch(){touchY=null;dragPixels=0;}
+host.addEventListener('touchend',endTouch,{passive:true});
+host.addEventListener('touchcancel',endTouch,{passive:true});
+let firstOutputWritten=false;
+function receiveTerminal(data,reset){
+ if(reset)terminal.reset();
+ if(!data)return;
+ terminal.write(Uint8Array.from(atob(data),c=>c.charCodeAt(0)),firstOutputWritten?undefined:()=>{
+  if(firstOutputWritten)return;
+  const buffer=terminal.buffer.active;
+  let row=buffer.viewportY;
+  while(row<buffer.viewportY+terminal.rows&&!buffer.getLine(row)?.translateToString(true).trim())row++;
+  if(row===buffer.viewportY+terminal.rows)return;
+  firstOutputWritten=true;
+  requestAnimationFrame(()=>SupperTerminal.outputReady());
+ });
+}
+</script></body></html>

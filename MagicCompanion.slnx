@@ -1,0 +1,13 @@
+<Solution>
+  <Folder Name="/src/" />
+  <Folder Name="/src/core/">
+    <Project Path="src/core/MagicCompanion.Core/MagicCompanion.Core.csproj" />
+  </Folder>
+  <Folder Name="/src/windows/">
+    <Project Path="src/windows/MagicCompanion.Agent/MagicCompanion.Agent.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/MagicCompanion.Tests/MagicCompanion.Tests.csproj" />
+    <Project Path="tests/MagicCompanion.PlatformChecks/MagicCompanion.PlatformChecks.csproj" />
+  </Folder>
+</Solution>
