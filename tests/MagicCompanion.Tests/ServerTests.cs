@@ -50,6 +50,7 @@ public sealed class ServerTests
         using var first = await Connect(port, phone, certificate);
         using var second = await Connect(port, phone, certificate);
         Assert.Equal(first.Session, second.Session);
+        Assert.False((await first.ReceiveEvent("control.paused")).GetProperty("paused").GetBoolean());
         var subscribed = await first.Request("todo.subscribe");
         Assert.Equal("ok", subscribed.GetProperty("status").GetString());
         store.ChangeTodo("add", title: "电脑配置待办");
@@ -133,12 +134,27 @@ public sealed class ServerTests
         Assert.Equal(captured.GetRawText(), captureReplay.GetRawText());
         Assert.Equal(1, platform.Captures);
         Assert.Equal(screenshotDirectory, platform.ScreenshotDirectory);
-        server.SetPaused(true);
+        server.SetPaused(false, locked: true, allowLockedAudio: true);
+        Assert.True((await bluetooth.ReceiveEvent("control.paused")).GetProperty("paused").GetBoolean());
+        using (var reconnected = await Connect(server.BluetoothPort, phone, certificate))
+        {
+            Assert.True((await reconnected.ReceiveEvent("control.paused")).GetProperty("paused").GetBoolean());
+        }
+        await bluetooth.ReceiveEvent("system.metrics");
         var pausedCapture = await bluetooth.Request("screen.capture");
         Assert.Equal("PERMISSION_DENIED", pausedCapture.GetProperty("error").GetProperty("code").GetString());
+        Assert.Equal("ok", (await bluetooth.Request("audio.volume.set", new { level = .2 })).GetProperty("status").GetString());
+        Assert.Equal("PERMISSION_DENIED", (await bluetooth.Request("task.run", new { templateId = template.Id }))
+            .GetProperty("error").GetProperty("code").GetString());
+        server.SetPaused(true, locked: true, allowLockedAudio: true);
+        Assert.False((await bluetooth.ReceiveEvent("control.paused")).GetProperty("lockedAudio").GetBoolean());
+        Assert.Equal("PERMISSION_DENIED", (await bluetooth.Request("audio.volume.set", new { level = .2 }))
+            .GetProperty("error").GetProperty("code").GetString());
         Assert.True(terminal.Closes > 0);
         Assert.Equal("PERMISSION_DENIED", (await bluetooth.Request("terminal.open", new { columns = 80, rows = 24 })).GetProperty("error").GetProperty("code").GetString());
         server.SetPaused(false);
+        Assert.False((await bluetooth.ReceiveEvent("control.paused")).GetProperty("paused").GetBoolean());
+        Assert.Equal("ok", (await bluetooth.Request("terminal.open", new { columns = 80, rows = 24 })).GetProperty("status").GetString());
         store.SaveDevice(device with { Permissions = ["todos.read", "system.read"] });
         var deniedCapture = await bluetooth.Request("screen.capture");
         Assert.Equal("PERMISSION_DENIED", deniedCapture.GetProperty("error").GetProperty("code").GetString());
@@ -296,13 +312,13 @@ public sealed class ServerTests
             }
         }
 
-        public async Task ReceiveEvent(string eventType)
+        public async Task<JsonElement> ReceiveEvent(string eventType)
         {
             while (true)
             {
                 var value = await Receive();
                 if (value.TryGetProperty("eventType", out var name) && name.GetString() == eventType)
-                    return;
+                    return value.GetProperty("payload");
             }
         }
 

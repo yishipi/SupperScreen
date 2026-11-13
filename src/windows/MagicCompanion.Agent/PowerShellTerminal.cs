@@ -16,12 +16,18 @@ public sealed class PowerShellTerminal : ITerminalPlatform
 
     public static TaskTemplate Script(string name, string path)
     {
-        if (!Path.IsPathFullyQualified(path) || !File.Exists(path) || !path.EndsWith(".ps1", StringComparison.OrdinalIgnoreCase))
-            throw new AgentException("INVALID_ARGUMENT", "请选择存在的 .ps1 脚本");
+        if (!Path.IsPathFullyQualified(path) || !File.Exists(path))
+            throw new AgentException("INVALID_ARGUMENT", "请选择存在的脚本");
+        var title = AgentStore.ValidateTitle(name);
+        var directory = Path.GetDirectoryName(path)!;
+        if (path.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase))
+            return new(Wire.NewId(), title, Path.Combine(Environment.SystemDirectory, "cmd.exe"), [], directory, BatchFile: path);
+        if (!path.EndsWith(".ps1", StringComparison.OrdinalIgnoreCase))
+            throw new AgentException("INVALID_ARGUMENT", "请选择 .ps1 或 .cmd 脚本");
         // Windows PowerShell 5.1 otherwise uses the active legacy code page for redirected output.
         var command = "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & '" + path.Replace("'", "''") + "'";
-        return new(Wire.NewId(), AgentStore.ValidateTitle(name), Executable,
-            ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], Path.GetDirectoryName(path)!);
+        return new(Wire.NewId(), title, Executable,
+            ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], directory);
     }
 
     public TerminalState Open(string owner, int columns, int rows)

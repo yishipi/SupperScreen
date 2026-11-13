@@ -8,8 +8,8 @@ android {
         applicationId = "com.magiccompanion.app"
         minSdk = 28
         targetSdk = 36
-        versionCode = 22
-        versionName = "0.21.0"
+        versionCode = 23
+        versionName = "0.22.0"
     }
     buildFeatures { compose = true }
     sourceSets.getByName("test").resources.srcDir("../../../shared/protocol")

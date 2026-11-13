@@ -138,7 +138,9 @@ public sealed record TaskTemplate(
     string[] Arguments,
     string WorkingDirectory,
     int TimeoutSeconds = 300,
-    Dictionary<string, string>? ParameterPatterns = null
+    Dictionary<string, string>? ParameterPatterns = null,
+    string? BatchFile = null,
+    bool AllowWhileLocked = false
 );
 
 public sealed record TaskJob(

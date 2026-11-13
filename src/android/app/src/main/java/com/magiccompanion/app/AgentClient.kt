@@ -91,10 +91,12 @@ data class UiState(
     val audioAvailable: Boolean = false,
     val error: String = "",
     val paused: Boolean = false,
+    val locked: Boolean = false,
+    val lockedAudio: Boolean = false,
     val busy: Boolean = false,
     val notice: String = "",
     val templates: List<JSONObject> = emptyList(),
-    val jobs: List<JSONObject> = emptyList(),
+    val jobs: Map<String, JSONObject> = emptyMap(),
     val terminalId: String = "",
     val terminalRunning: Boolean = false,
 )
@@ -729,7 +731,13 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
                 selected?.let { scope.launch { subscribe(it) } }
             }
             "device.revoked" -> forget()
-            "control.paused" -> mutable.update { it.copy(paused = payload.optBoolean("paused")) }
+            "control.paused" -> mutable.update {
+                it.copy(
+                    paused = payload.optBoolean("paused"),
+                    locked = payload.optBoolean("locked"),
+                    lockedAudio = payload.optBoolean("lockedAudio"),
+                )
+            }
             "task.updated" -> applyJob(payload)
         }
     }
@@ -1025,13 +1033,16 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
     }
 
     private fun applyJob(job: JSONObject) {
-        mutable.update {
-            it.copy(
-                jobs =
-                    (it.jobs.filterNot { old -> old.optString("jobId") == job.optString("jobId") } +
-                            job)
-                        .takeLast(20)
-            )
+        val templateId = job.getString("templateId")
+        mutable.update { state ->
+            val previous = state.jobs[templateId]
+            if (previous != null) {
+                if (previous.optString("startedAt") > job.optString("startedAt")) return@update state
+                if (previous.optString("jobId") == job.optString("jobId") &&
+                    previous.optString("state") != "running" && job.optString("state") == "running"
+                ) return@update state
+            }
+            state.copy(jobs = state.jobs + (templateId to job))
         }
     }
 

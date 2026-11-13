@@ -28,17 +28,19 @@ public sealed class TaskRunner(AgentStore store) : IDisposable, IAsyncDisposable
             store.GetSetting("taskTemplates") ?? "[]",
             Wire.Json
         ) ?? [];
-    public TaskJob Start(string deviceId, string templateId, JsonElement parameters)
+    public TaskJob Start(string deviceId, string templateId, JsonElement parameters, bool locked = false)
     {
         lock (startGate)
-            return StartInternal(deviceId, templateId, parameters);
+            return StartInternal(deviceId, templateId, parameters, locked);
     }
 
-    private TaskJob StartInternal(string deviceId, string templateId, JsonElement parameters)
+    private TaskJob StartInternal(string deviceId, string templateId, JsonElement parameters, bool locked)
     {
         var template =
             Templates.FirstOrDefault(t => t.Id == templateId)
             ?? throw new AgentException("INVALID_ARGUMENT", "任务模板不存在");
+        if (locked && !template.AllowWhileLocked)
+            throw new AgentException("PERMISSION_DENIED", "此脚本未获准在锁屏时运行");
         if (jobs.Values.Count(j => j.Snapshot.State == "running") >= 4)
             throw new AgentException("DEVICE_BUSY", "同时运行任务最多 4 个");
         if (
@@ -83,12 +85,26 @@ public sealed class TaskRunner(AgentStore store) : IDisposable, IAsyncDisposable
             RedirectStandardOutput = true,
             RedirectStandardError = true,
         };
-        foreach (var argument in template.Arguments)
+        if (template.BatchFile is { } batchFile)
         {
-            var expanded = argument;
-            foreach (var (key, value) in values)
-                expanded = expanded.Replace("${" + key + "}", value, StringComparison.Ordinal);
-            info.ArgumentList.Add(expanded);
+            if (!OperatingSystem.IsWindows() || !Path.IsPathFullyQualified(batchFile)
+                || !batchFile.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase) || !File.Exists(batchFile)
+                || patterns.Count != 0 || template.Arguments.Length != 0)
+                throw new AgentException("INVALID_ARGUMENT", "CMD 脚本路径无效或包含参数配置");
+            info.FileName = Path.Combine(Environment.SystemDirectory, "cmd.exe");
+            info.Environment["SUPPERSCREEN_BATCH_FILE"] = batchFile;
+            info.Arguments = "/D /S /V:OFF /C \"chcp 65001 >nul & \"%SUPPERSCREEN_BATCH_FILE%\"\"";
+            info.StandardOutputEncoding = info.StandardErrorEncoding = System.Text.Encoding.UTF8;
+        }
+        else
+        {
+            foreach (var argument in template.Arguments)
+            {
+                var expanded = argument;
+                foreach (var (key, value) in values)
+                    expanded = expanded.Replace("${" + key + "}", value, StringComparison.Ordinal);
+                info.ArgumentList.Add(expanded);
+            }
         }
         var job = new TaskJob(
             Wire.NewId(),
@@ -240,9 +256,11 @@ public sealed class TaskRunner(AgentStore store) : IDisposable, IAsyncDisposable
         throw new AgentException("INVALID_ARGUMENT", "任务不存在");
     }
 
-    public TaskJob Cancel(string device, string id)
+    public TaskJob Cancel(string device, string id, bool locked = false)
     {
         var current = Get(device, id);
+        if (locked && !Templates.Any(t => t.Id == current.TemplateId && t.AllowWhileLocked))
+            throw new AgentException("PERMISSION_DENIED", "此脚本未获准在锁屏时操作");
         if (jobs.TryGetValue(id, out var running) && current.State == "running")
             running.Cancellation.Cancel();
         return current;

@@ -281,6 +281,7 @@ private fun HeaderButton(label: String, selected: Boolean, enabled: Boolean = tr
 private fun ConnectionBadge(state: UiState) {
     val colors = MaterialTheme.colorScheme
     val label = when {
+        state.online && state.locked -> "${state.transport} · 锁屏"
         state.online && state.paused -> "${state.transport} · 已暂停"
         state.online -> "${state.transport} · 已连接"
         else -> "未连接"
@@ -463,7 +464,7 @@ private fun AudioCard(state: UiState, client: AgentClient) {
         return
     }
     var volume by remember(state.volume) { mutableFloatStateOf(state.volume) }
-    val enabled = state.online && state.audioAvailable && !state.paused &&
+    val enabled = state.online && state.audioAvailable && (!state.paused || state.lockedAudio) &&
         !state.busy && "audio.control" in state.permissions
     Panel("音量与媒体", headerAction = {
         TextButton(onClick = { client.mute(!state.muted) }, enabled = enabled) {

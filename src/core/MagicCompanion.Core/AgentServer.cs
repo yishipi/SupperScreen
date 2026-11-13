@@ -69,6 +69,7 @@ public sealed class AgentServer : IAsyncDisposable
     private readonly ITerminalPlatform? terminal;
     private readonly string hostId;
     private readonly ConcurrentDictionary<string, Client> clients = new();
+    private readonly object pauseGate = new();
     private readonly ConcurrentDictionary<string, string> sessions = new();
     private readonly CancellationTokenSource stop = new();
     private WebApplication? app;
@@ -76,7 +77,13 @@ public sealed class AgentServer : IAsyncDisposable
     private Microsoft.AspNetCore.Server.Kestrel.Core.ListenOptions? bluetoothEndpoint;
     public int BluetoothPort => bluetoothEndpoint?.IPEndPoint?.Port ?? 0;
     public string? BluetoothAddress { get; set; }
-    public bool ControlPaused { get; private set; }
+    private sealed record ControlState(bool Paused, bool Locked, bool AllowLockedAudio)
+    {
+        public bool Blocked => Paused || Locked;
+        public object ToEvent() => new { paused = Blocked, locked = Locked && !Paused, lockedAudio = Locked && !Paused && AllowLockedAudio };
+    }
+    private volatile ControlState controlState = new(false, false, false);
+    public bool ControlPaused => controlState.Blocked;
     public event Action<string>? Diagnostic;
     public int LinkCount => clients.Count;
 
@@ -209,7 +216,11 @@ public sealed class AgentServer : IAsyncDisposable
             var auth = await AuthenticateAsync(socket, true, linked.Token);
             client = new(socket, auth.Device.DeviceId, auth.Session, context.Connection.LocalPort == BluetoothPort);
             var key = Wire.NewId();
-            clients[key] = client;
+            lock (pauseGate)
+            {
+                clients[key] = client;
+                client.Event("control.paused", controlState.ToEvent());
+            }
             sender = SendQueueAsync(client, linked.Token);
             _ = sender.ContinueWith(
                 completed =>
@@ -421,10 +432,11 @@ public sealed class AgentServer : IAsyncDisposable
         JsonElement p
     )
     {
-        void Demand(string permission, bool control = false)
+        var state = controlState;
+        void Demand(string permission, bool control = false, bool allowWhileLocked = false)
         {
             PermissionSet.Demand(device, permission);
-            if (control && ControlPaused)
+            if (control && (state.Paused || state.Locked && !allowWhileLocked))
                 throw new AgentException("PERMISSION_DENIED", "电脑已暂停控制");
         }
         ITerminalPlatform Terminal() => terminal ?? throw new AgentException("UNSUPPORTED_CAPABILITY", "此电脑未提供终端");
@@ -504,7 +516,7 @@ public sealed class AgentServer : IAsyncDisposable
                 client.Audio = true;
                 return platform.GetAudio();
             case "audio.volume.set":
-                Demand("audio.control", true);
+                Demand("audio.control", true, state.AllowLockedAudio);
                 if (
                     !p.TryGetProperty("level", out var number)
                     || !number.TryGetSingle(out var level)
@@ -515,10 +527,10 @@ public sealed class AgentServer : IAsyncDisposable
                     throw new AgentException("INVALID_ARGUMENT", "音量范围为 0～1");
                 return platform.SetAudio(level, null);
             case "audio.mute.set":
-                Demand("audio.control", true);
+                Demand("audio.control", true, state.AllowLockedAudio);
                 return platform.SetAudio(null, p.Boolean("muted"));
             case "media.command":
-                Demand("audio.control", true);
+                Demand("audio.control", true, state.AllowLockedAudio);
                 if (!await platform.MediaAsync(p.RequiredString("command", 32)))
                     throw new AgentException("UNSUPPORTED_CAPABILITY", "没有可控制的媒体会话");
                 return new { executed = true };
@@ -554,24 +566,26 @@ public sealed class AgentServer : IAsyncDisposable
                     {
                         t.Id,
                         t.Name,
+                        t.AllowWhileLocked,
                         parameters = t.ParameterPatterns?.Keys,
                     }),
                     // Older Android builds expect this field before loading script templates.
                     hotkeys = Array.Empty<object>(),
                 };
             case "task.run":
-                Demand("tasks.run", true);
+                Demand("tasks.run", true, allowWhileLocked: true);
                 return tasks.Start(
                     device.DeviceId,
                     p.RequiredString("templateId", 128),
-                    p.TryGetProperty("params", out var parameters) ? parameters : default
+                    p.TryGetProperty("params", out var parameters) ? parameters : default,
+                    state.Locked
                 );
             case "task.status.get":
                 Demand("tasks.read");
                 return tasks.Get(device.DeviceId, p.RequiredString("jobId", 128));
             case "task.cancel":
-                Demand("tasks.run", true);
-                return tasks.Cancel(device.DeviceId, p.RequiredString("jobId", 128));
+                Demand("tasks.run", true, allowWhileLocked: true);
+                return tasks.Cancel(device.DeviceId, p.RequiredString("jobId", 128), state.Locked);
             default:
                 throw new AgentException("UNSUPPORTED_ACTION", "不支持此操作");
         }
@@ -668,15 +682,21 @@ public sealed class AgentServer : IAsyncDisposable
         catch (OperationCanceledException) { }
     }
 
-    public void SetPaused(bool paused)
+    public void SetPaused(bool paused, bool locked = false, bool allowLockedAudio = false)
     {
-        ControlPaused = paused;
-        if (paused && store.Device() is { } device)
+        var next = new ControlState(paused, locked, allowLockedAudio);
+        bool closeTerminal;
+        lock (pauseGate)
         {
-            terminal?.Close(device.DeviceId);
+            if (controlState == next)
+                return;
+            closeTerminal = !controlState.Blocked && next.Blocked;
+            controlState = next;
+            foreach (var c in clients.Values)
+                c.Event("control.paused", next.ToEvent());
         }
-        foreach (var c in clients.Values)
-            c.Event("control.paused", new { paused });
+        if (closeTerminal && store.Device() is { } device)
+            terminal?.Close(device.DeviceId);
     }
 
     private static string ErrorResponse(string? id, string code, string message) =>

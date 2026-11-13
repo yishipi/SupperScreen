@@ -146,5 +146,21 @@ try
     if (result.State != "succeeded" || !result.Lines.Contains("脚本成功"))
         throw new Exception("Script failed: " + string.Join("\n", result.Lines));
     Console.WriteLine("PASS: configured PowerShell script, spaces/quotes in path, Chinese output, exit status");
+    var batchPath = Path.Combine(temporary, "带 空格 & %PATH% !.cmd");
+    await File.WriteAllTextAsync(batchPath, "@echo off\r\necho 脚本输出\r\n1>&2 echo STDERR-LINE\r\nexit /b 7\r\n", new UTF8Encoding(false));
+    var batch = PowerShellTerminal.Script("测试 CMD", batchPath) with { AllowWhileLocked = true };
+    store.SetSetting("taskTemplates", Wire.Serialize(new[] { script, batch }));
+    try
+    {
+        runner.Start("phone", script.Id, default, locked: true);
+        throw new Exception("Expected a non-allowed script to be denied while locked");
+    }
+    catch (AgentException ex) when (ex.Code == "PERMISSION_DENIED") { }
+    job = runner.Start("phone", batch.Id, default, locked: true);
+    while (runner.Get("phone", job.JobId).State == "running") await Task.Delay(100, timeout.Token);
+    result = runner.Get("phone", job.JobId);
+    if (result.State != "failed" || result.ExitCode != 7 || !result.Lines.Contains("脚本输出") || !result.Lines.Contains("STDERR-LINE"))
+        throw new Exception("CMD result mismatch: " + string.Join("\n", result.Lines));
+    Console.WriteLine("PASS: configured CMD script, quoted path, UTF-8 stdout/stderr, exit code and lock-screen allowlist");
 }
 finally { Directory.Delete(temporary, true); }

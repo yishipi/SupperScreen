@@ -16,7 +16,7 @@ Windows 通过 ConPTY 启动 PowerShell 7（标准安装目录存在时）或系
 
 读偏移对应终端字节流，响应 offset 是下一次读偏移。手机按顺序读取并交给 xterm 的流式 UTF-8 解析器。电脑保留最近 256 KiB；偏移已被淘汰时 reset=true，从保留尾部开始并清屏。输入不写持久化去重表，输入结果不明时停止发送并提示重开，避免自动重复命令。关闭终端、撤权、解除配对、暂停控制、最后一条认证链路断开及服务退出均结束终端。后台暂停读输出，连接仍在时保留进程。
 
-快捷脚本复用 TaskTemplate / TaskRunner 和 tasks.read/run 权限。电脑添加 .ps1 文件后生成固定 PowerShell 命令及工作目录，通过固定 -Command 设置 UTF-8 输出并调用经单引号转义的本机脚本路径。默认无手机参数，不修改执行策略。高级参数模板保持已有规则；任务日志按现有有界结果保存，不写诊断。
+快捷脚本复用 TaskTemplate / TaskRunner 和 tasks.read/run 权限。电脑添加 .ps1 文件后生成固定 PowerShell 命令及工作目录，通过固定 -Command 设置 UTF-8 输出并调用经单引号转义的本机脚本路径。默认无手机参数，不修改执行策略。固定 CMD 脚本保存 batchFile，在其工作目录中由 cmd.exe 执行，捕获退出码和 UTF-8 标准输出及错误输出。高级参数模板保持已有规则；任务日志按现有有界结果保存，不写诊断。
 
 本文件描述当前代码实际使用的协议。早期设计中不同的字段名以本文件和 `Models.cs` / `AgentServer.cs` 为准，protocolVersion 为 1。
 
@@ -68,13 +68,15 @@ Windows 通过 ConPTY 启动 PowerShell 7（标准安装目录存在时）或系
 | audio.state.get / audio.state.subscribe | revision、level（0～1）、muted、available |
 | audio.volume.set / audio.mute.set | level / muted；返回实际音量状态 |
 | media.command | command 为 playPause / previous / next |
-| task.templates | 需要 tasks.read，返回允许的 items。兼容旧手机的 hotkeys 字段始终为空数组 |
+| task.templates | 需要 tasks.read，返回允许的 items，包括每条任务的 allowWhileLocked。兼容旧手机的 hotkeys 字段始终为空数组 |
 | task.run | templateId、params 对象；返回 jobId 等状态 |
 | task.status.get / task.cancel | jobId；只允许读取/取消所属设备的任务 |
 
 待办快照为 `{revision,updatedAt,items:[{id,title,completed,sortOrder,color?,textColor?,backgroundColor?}]}`。revision 持久化且递增。手机仅可提交完成操作，不能新增、编辑标题或配色。
 
 推送事件包括 `todo.snapshot`、`system.metrics`、`audio.state`、`app.catalog.changed`、`permission.changed`、`device.revoked`、`control.paused`、`task.updated`。
+
+客户端认证后，电脑发送当前 `control.paused` 状态，包含 paused、locked 和 lockedAudio。电脑锁屏时，获得权限的手机可继续接收性能和待办。音量及媒体和逐条允许的脚本可在锁屏时操作。手动暂停、睡眠和注销优先于锁屏例外。PowerShell、应用启动和截屏仍需要解锁。
 
 非幂等操作 `app.launch / task.run / media.command` 按 deviceId + requestId 去重。相同 ID 不同内容会被拒绝；完成结果保留至少 10 分钟。异常重启后的执行中请求记为 unknown。手机不自动重放结果未知的操作，只查询原请求状态。
 

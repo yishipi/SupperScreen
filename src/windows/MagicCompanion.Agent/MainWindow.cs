@@ -27,7 +27,11 @@ internal sealed partial class MainWindow : Window
     private long nextConnectionCheck;
     private Task connectionUpdate = Task.CompletedTask;
     private bool restartingServer => !connectionUpdate.IsCompleted;
-    private bool controlPaused;
+    private bool manuallyPaused;
+    private bool sessionLocked;
+    private bool sessionLoggedOff;
+    private bool suspended;
+    private bool allowLockedAudio;
     private AdbBridge? adb;
     private BluetoothRelay? bluetooth;
     private readonly List<LanDiscovery> discovery = [];
@@ -77,6 +81,7 @@ internal sealed partial class MainWindow : Window
                 );
         Directory.CreateDirectory(dataDirectory);
         store = new(Path.Combine(dataDirectory, "agent.db"));
+        allowLockedAudio = store.GetSetting("allowLockedAudio") == "true";
         identity = new(store, dataDirectory);
         platform = new();
         pairing = new(store, identity.HostId);
@@ -141,7 +146,11 @@ internal sealed partial class MainWindow : Window
         menu.Items.Add(
             "暂停 / 恢复手机控制",
             null,
-            (_, _) => Dispatcher.Invoke(() => SetControlPaused(!controlPaused))
+            (_, _) => Dispatcher.Invoke(() =>
+            {
+                manuallyPaused = !manuallyPaused;
+                UpdateControlPause();
+            })
         );
         menu.Items.Add("退出", null, (_, _) => Dispatcher.Invoke(CloseApplication));
         tray.ContextMenuStrip = menu;
@@ -263,6 +272,7 @@ internal sealed partial class MainWindow : Window
                         or ArgumentException
                         or IOException
                         or JsonException
+                        or System.Runtime.InteropServices.COMException
                         or System.ComponentModel.Win32Exception
             )
         {
@@ -438,6 +448,20 @@ internal sealed partial class MainWindow : Window
         connectionStatus.Children.Add(bluetoothStatus);
         connectionStatus.Children.Add(lanStatus);
         panel.Children.Add(Card(connectionStatus));
+        var lockedAudio = new CheckBox { Content = "锁屏时允许音量与媒体", IsChecked = allowLockedAudio };
+        lockedAudio.Click += (_, _) => Try(() =>
+        {
+            var enabled = lockedAudio.IsChecked == true;
+            store.SetSetting("allowLockedAudio", enabled ? "true" : "false");
+            allowLockedAudio = enabled;
+            UpdateControlPause();
+        });
+        panel.Children.Add(new Expander
+        {
+            Header = "锁屏时允许的操作",
+            Content = lockedAudio,
+            Margin = new Thickness(0, 4, 0, 8),
+        });
 
         var lan = new CheckBox
         {
@@ -489,24 +513,29 @@ internal sealed partial class MainWindow : Window
         hotkeyRow.Children.Add(saveHotkey);
         hotkeyRow.Children.Add(quick);
         preferences.Children.Add(hotkeyRow);
-        using (var startup = Registry.CurrentUser.OpenSubKey(
-            @"Software\Microsoft\Windows\CurrentVersion\Run"))
+        const string runKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        var startupLink = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "SupperScreen.lnk");
+        using (var startup = Registry.CurrentUser.OpenSubKey(runKey))
         {
+            var legacyStartup = startup?.GetValue("MagicCompanion") != null;
             var autostart = new CheckBox
             {
-                Content = "登录后在托盘运行",
-                IsChecked = startup?.GetValue("MagicCompanion") != null,
+                Content = "登录后在托盘运行（需确认管理员权限）",
+                IsChecked = legacyStartup || File.Exists(startupLink),
                 Margin = new Thickness(0, 12, 0, 12),
             };
-            autostart.Click += (_, _) => Try(() =>
+            void SaveStartup()
             {
-                using var run = Registry.CurrentUser.CreateSubKey(
-                    @"Software\Microsoft\Windows\CurrentVersion\Run");
                 if (autostart.IsChecked == true)
-                    run.SetValue("MagicCompanion", "\"" + Environment.ProcessPath + "\" --tray");
+                    SaveStartupLink(startupLink);
                 else
-                    run.DeleteValue("MagicCompanion", false);
-            });
+                    File.Delete(startupLink);
+                using var run = Registry.CurrentUser.OpenSubKey(runKey, writable: true);
+                run?.DeleteValue("MagicCompanion", false);
+            }
+            autostart.Click += (_, _) => Try(SaveStartup);
+            if (legacyStartup || File.Exists(startupLink))
+                Try(SaveStartup);
             preferences.Children.Add(autostart);
         }
         panel.Children.Add(new Expander { Header = "偏好设置", Content = preferences });
@@ -528,16 +557,28 @@ internal sealed partial class MainWindow : Window
         return panel;
     }
 
+    private static void SaveStartupLink(string path)
+    {
+        var executable = Environment.ProcessPath!.Replace("'", "''");
+        var command = $"Start-Process -FilePath '{executable}' -ArgumentList '--tray' -Verb RunAs";
+        var encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(command));
+        dynamic shell = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell", throwOnError: true)!)!;
+        dynamic link = shell.CreateShortcut(path);
+        link.TargetPath = Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
+        link.Arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand " + encoded;
+        link.Save();
+    }
+
     private StackPanel BuildTasks()
     {
         var p = new StackPanel();
         var templates = scriptJson;
         templates.Text = store.GetSetting("taskTemplates") ?? "[]";
-        p.Children.Add(Button("添加 PowerShell 脚本", AddScript, true));
+        p.Children.Add(Button("添加脚本（.ps1 / .cmd）", AddScript, true));
         p.Children.Add(scriptRows);
         RenderScripts();
         var advanced = new StackPanel();
-        templates.ToolTip = "id、name、executable、arguments、workingDirectory、timeoutSeconds、parameterPatterns";
+        templates.ToolTip = "id、name、executable、arguments、workingDirectory、timeoutSeconds、parameterPatterns、batchFile、allowWhileLocked";
         advanced.Children.Add(templates);
         advanced.Children.Add(
             Button(
@@ -574,7 +615,7 @@ internal sealed partial class MainWindow : Window
 
     private void AddScript()
     {
-        var picker = new OpenFileDialog { Filter = "PowerShell 脚本 (*.ps1)|*.ps1", CheckFileExists = true };
+        var picker = new OpenFileDialog { Filter = "脚本 (*.ps1;*.cmd)|*.ps1;*.cmd", CheckFileExists = true };
         if (picker.ShowDialog(this) != true) return;
         var name = Prompt("脚本名称", Path.GetFileNameWithoutExtension(picker.FileName));
         if (string.IsNullOrWhiteSpace(name)) return;
@@ -604,6 +645,22 @@ internal sealed partial class MainWindow : Window
                 RenderScripts();
             }));
             DockPanel.SetDock(remove, Dock.Right); row.Children.Add(remove);
+            var locked = new CheckBox
+            {
+                Content = "锁屏时允许运行",
+                IsChecked = template.AllowWhileLocked,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(8, 0, 8, 0),
+            };
+            locked.Click += (_, _) => Try(() =>
+            {
+                var saved = JsonSerializer.Deserialize<TaskTemplate[]>(store.GetSetting("taskTemplates") ?? "[]", Wire.Json) ?? [];
+                store.SetSetting("taskTemplates", Wire.Serialize(saved.Select(t =>
+                    t.Id == template.Id ? t with { AllowWhileLocked = locked.IsChecked == true } : t).ToArray()));
+                scriptJson.Text = store.GetSetting("taskTemplates")!;
+            });
+            DockPanel.SetDock(locked, Dock.Right);
+            row.Children.Add(locked);
             row.Children.Add(new TextBlock { Text = template.Name, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(12, 0, 0, 0) });
             scriptRows.Children.Add(Card(row));
         }
@@ -707,7 +764,7 @@ internal sealed partial class MainWindow : Window
         var listener = new AgentServer(store, platform, pairing, identity.HostId, new PowerShellTerminal());
         server = listener;
         listener.Diagnostic += text => Dispatcher.BeginInvoke(() => RecordDiagnostic(text));
-        listener.SetPaused(controlPaused);
+        UpdateControlPause();
         serverCertificate = identity.CreateCertificate(addresses);
         await listener.StartAsync(serverCertificate, UsbPort, LanPort, addresses, enableBluetooth: true);
     }
@@ -1001,24 +1058,32 @@ internal sealed partial class MainWindow : Window
 
     private void SessionChanged(object sender, SessionSwitchEventArgs e)
     {
-        if (
-            e.Reason == SessionSwitchReason.SessionLock
-            || e.Reason == SessionSwitchReason.SessionLogoff
-        )
-            Dispatcher.BeginInvoke(() => SetControlPaused(true));
+        if (e.Reason is not (SessionSwitchReason.SessionLock or SessionSwitchReason.SessionUnlock
+            or SessionSwitchReason.SessionLogoff))
+            return;
+        Dispatcher.BeginInvoke(() =>
+        {
+            if (e.Reason == SessionSwitchReason.SessionLogoff)
+                sessionLoggedOff = true;
+            else
+                sessionLocked = e.Reason == SessionSwitchReason.SessionLock;
+            UpdateControlPause();
+        });
     }
 
     private void PowerChanged(object sender, PowerModeChangedEventArgs e)
     {
-        if (e.Mode == PowerModes.Suspend)
-            Dispatcher.BeginInvoke(() => SetControlPaused(true));
+        if (e.Mode is not (PowerModes.Suspend or PowerModes.Resume))
+            return;
+        Dispatcher.BeginInvoke(() =>
+        {
+            suspended = e.Mode == PowerModes.Suspend;
+            UpdateControlPause();
+        });
     }
 
-    private void SetControlPaused(bool paused)
-    {
-        controlPaused = paused;
-        server?.SetPaused(paused);
-    }
+    private void UpdateControlPause() =>
+        server?.SetPaused(manuallyPaused || suspended || sessionLoggedOff, sessionLocked, allowLockedAudio);
 
     private async void CloseApplication()
     {

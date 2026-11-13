@@ -1,6 +1,5 @@
 package com.magiccompanion.app
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -32,69 +31,20 @@ private fun TaskCard(state: UiState, client: AgentClient) {
     var parameters by remember { mutableStateOf("{}") }
     Panel("快捷脚本") {
         if (state.templates.isEmpty())
-            Text("在电脑「脚本」中添加 .ps1 文件", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("在电脑「脚本」中添加 .ps1 或 .cmd 文件", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         state.templates.forEach { task ->
-            Row(
-                Modifier.fillMaxWidth().heightIn(min = 36.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(task.getString("name"), Modifier.weight(1f), fontSize = 13.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                TextButton(
-                    onClick = {
-                        if ((task.optJSONArray("parameters")?.length() ?: 0) == 0)
-                            client.runTask(task.getString("id"), JSONObject())
-                        else { template = task; parameters = "{}" }
-                    },
-                    enabled = state.online && !state.paused && !state.busy && "tasks.run" in state.permissions,
-                    modifier = Modifier.height(36.dp),
-                    contentPadding = PaddingValues(horizontal = 8.dp),
-                ) { Text("运行", fontSize = 12.sp) }
-            }
-        }
-        if (state.jobs.isNotEmpty())
-            Text("执行记录", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        state.jobs.forEach { job ->
-            key(job.getString("jobId")) {
-                var showLogs by remember { mutableStateOf(false) }
-                val status = when (job.optString("state")) {
-                    "running" -> "运行中"
-                    "succeeded" -> "已完成"
-                    "failed" -> "执行失败"
-                    "cancelled" -> "已取消"
-                    else -> "状态待确认"
-                }
-                HorizontalDivider()
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text(state.templates.firstOrNull { it.optString("id") == job.optString("templateId") }?.optString("name") ?: job.optString("templateId"), Modifier.weight(1f), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text(status, fontSize = 11.sp, color = MaterialTheme.colorScheme.primary)
-                }
-                Row {
-                    TextButton(
-                        onClick = {
-                            client.refreshJob(job.getString("jobId"))
-                            showLogs = !showLogs
-                        },
-                        enabled = state.online,
-                    ) {
-                        Text(if (showLogs) "收起日志" else "查看日志", fontSize = 12.sp)
+            val id = task.getString("id")
+            key(id) {
+                val canRun = state.online && "tasks.run" in state.permissions &&
+                    (!state.paused || state.locked && task.optBoolean("allowWhileLocked"))
+                ScriptItem(task, state.jobs[id], canRun, state, client) {
+                    if ((task.optJSONArray("parameters")?.length() ?: 0) == 0)
+                        client.runTask(id, JSONObject())
+                    else {
+                        template = task
+                        parameters = "{}"
                     }
-                    if (job.optString("state") == "running")
-                        TextButton(
-                            onClick = { client.cancelJob(job.getString("jobId")) },
-                            enabled = state.online,
-                        ) {
-                            Text("取消")
-                        }
                 }
-                if (showLogs)
-                    Text(
-                        job.optJSONArray("lines")?.strings()?.takeLast(8)?.joinToString("\n").orEmpty(),
-                        modifier = Modifier.fillMaxWidth().heightIn(max = 100.dp)
-                            .background(MaterialTheme.colorScheme.background, RoundedCornerShape(8.dp))
-                            .verticalScroll(rememberScrollState()).padding(8.dp),
-                        fontSize = 11.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
             }
         }
     }
@@ -129,4 +79,76 @@ private fun TaskCard(state: UiState, client: AgentClient) {
             dismissButton = { TextButton(onClick = { template = null }) { Text("取消") } },
         )
     }
+}
+
+@Composable
+private fun ScriptItem(
+    task: JSONObject,
+    job: JSONObject?,
+    canRun: Boolean,
+    state: UiState,
+    client: AgentClient,
+    run: () -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val running = job?.optString("state") == "running"
+    val status = when (job?.optString("state")) {
+        null -> if (state.locked && !canRun) "解锁后可运行" else ""
+        "running" -> "运行中"
+        "succeeded" -> "已完成"
+        "failed" -> "失败"
+        "cancelled" -> "已取消"
+        else -> "结果未知"
+    }
+    val jobId = job?.getString("jobId")
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.background,
+    ) {
+        Column(Modifier.padding(horizontal = 8.dp)) {
+            Row(
+                Modifier.fillMaxWidth().heightIn(min = 36.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    task.getString("name"), Modifier.weight(1f), fontSize = 12.sp,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                )
+                if (status.isNotEmpty())
+                    Text(status, fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (jobId != null)
+                    ScriptButton(if (expanded) "收起" else "日志", true) {
+                        expanded = !expanded
+                        if (expanded && state.online) client.refreshJob(jobId)
+                    }
+                if (running && jobId != null)
+                    ScriptButton("取消", canRun && !state.busy) { client.cancelJob(jobId) }
+                else ScriptButton("运行", canRun && !state.busy, run)
+            }
+            if (expanded && job != null) {
+                val lines = job.optJSONArray("lines")?.strings().orEmpty()
+                val code = if (job.isNull("exitCode")) null else job.optInt("exitCode")
+                if (code != null)
+                    Text("退出码 $code", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(
+                    lines.joinToString("\n").ifBlank { if (running) "暂无输出" else "无日志" },
+                    modifier = Modifier.fillMaxWidth().heightIn(max = 84.dp)
+                        .verticalScroll(rememberScrollState()).padding(bottom = 5.dp),
+                    fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ScriptButton(label: String, enabled: Boolean, onClick: () -> Unit) {
+    TextButton(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = Modifier.height(36.dp),
+        contentPadding = PaddingValues(horizontal = 5.dp),
+    ) { Text(label, fontSize = 11.sp, maxLines = 1) }
 }
