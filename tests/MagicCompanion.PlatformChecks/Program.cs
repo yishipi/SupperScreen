@@ -103,7 +103,8 @@ async Task WaitFor(string expected)
 // Wait for PSReadLine to initialize before sending a command.
 await WaitFor("PS ");
 terminal.Resize("test-owner", session.Id, 90, 20);
-terminal.Write("test-owner", session.Id, 1, "$ssProbe = 40; [Console]::WriteLine(('SUPPER'+'-READY'));\r");
+// The hosted Windows runner may start with a legacy console code page.
+terminal.Write("test-owner", session.Id, 1, "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $ssProbe = 40; [Console]::WriteLine(('SUPPER'+'-READY'));\r");
 await WaitFor("SUPPER-READY");
 terminal.Write("test-owner", session.Id, 2, "$ssProbe++; [Console]::WriteLine(('VALUE=' + $ssProbe)); [Console]::WriteLine([char]0x4E2D + [string][char]0x6587)\r");
 // A duplicate input sequence must not execute the increment again.
