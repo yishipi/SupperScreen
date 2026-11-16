@@ -63,6 +63,18 @@ data class AllowedApp(
     val icon: Bitmap? = null,
 )
 
+internal data class MetricsState(
+    val cpu: Double = 0.0,
+    val ramUsed: Long = 0,
+    val ramTotal: Long = 0,
+    val diskFree: Long = 0,
+    val disks: List<DiskCapacity> = emptyList(),
+    val diskRead: Long? = null,
+    val diskWrite: Long? = null,
+    val networkReceive: Long? = null,
+    val networkSend: Long? = null,
+)
+
 data class UiState(
     val paired: Boolean = false,
     val online: Boolean = false,
@@ -77,15 +89,6 @@ data class UiState(
     val todoTime: String = "",
     val todoRevision: Long = -1,
     val apps: List<AllowedApp> = emptyList(),
-    val cpu: Double = 0.0,
-    val ramUsed: Long = 0,
-    val ramTotal: Long = 0,
-    val diskFree: Long = 0,
-    val disks: List<DiskCapacity> = emptyList(),
-    val diskRead: Long? = null,
-    val diskWrite: Long? = null,
-    val networkReceive: Long? = null,
-    val networkSend: Long? = null,
     val volume: Float = 0f,
     val muted: Boolean = false,
     val audioAvailable: Boolean = false,
@@ -155,16 +158,20 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
     private val deviceId: String
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mutable = MutableStateFlow(UiState())
+    private val mutableMetrics = MutableStateFlow(MetricsState())
+    internal val metrics = mutableMetrics.asStateFlow()
+    private val refreshRequests = Channel<Unit>(Channel.CONFLATED)
+    private val catalogRefreshRequests = Channel<Unit>(Channel.CONFLATED)
     private val capturingScreens = java.util.concurrent.atomic.AtomicBoolean()
     val state = mutable.asStateFlow()
     @Volatile
     private var config: JSONObject? =
         prefs.getString("host", null)?.let { runCatching { JSONObject(it) }.getOrNull() }
 
-    private data class Link(
+    private class Link(
         val url: String,
         val kind: String,
-        var socket: WebSocket? = null,
+        @Volatile var socket: WebSocket? = null,
         @Volatile var session: String? = null,
         @Volatile var bluetoothCapabilities: Set<String>? = null,
     )
@@ -173,6 +180,7 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
         kind != "bluetooth" || bluetoothCapabilities?.contains(capability) == true
 
     private val links = ConcurrentHashMap<String, Link>()
+    private var pinnedClient: Pair<String, OkHttpClient>? = null
 
     private data class Pending(val link: Link, val completion: CompletableDeferred<JSONObject>)
     private class RequestRejected(message: String) : java.io.IOException(message)
@@ -182,10 +190,31 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
     @Volatile private var pairClaim: String? = null
     private var discovery: NsdManager.DiscoveryListener? = null
     private val nsd = application.getSystemService(Context.NSD_SERVICE) as NsdManager
-    private var running = true
+    @Volatile private var running = true
     @Volatile private var visible = true
+    @Volatile private var displayBlanked = false
+    private val telemetryVisible: Boolean get() = visible && !displayBlanked
 
     init {
+        scope.launch {
+            val subscribed = mutableMapOf<Link, WebSocket>()
+            for (request in refreshRequests) {
+                try {
+                    reconcileSubscriptions(subscribed)
+                } catch (_: org.json.JSONException) {
+                    report("电脑返回的订阅数据格式无效")
+                }
+            }
+        }
+        scope.launch {
+            for (request in catalogRefreshRequests) {
+                val link = selected ?: continue
+                if (!visible) continue
+                val permissions = mutable.value.permissions
+                if ("tasks.read" in permissions) refreshTemplates(link)
+                if (selected === link && link.supports("apps") && "app.launch" in permissions) refreshApps(link)
+            }
+        }
         mutable.update { it.copy(bluetoothReady = bluetoothEnabled(getApplication())) }
         if (!keys.containsAlias(alias))
             KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore")
@@ -338,6 +367,7 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
     }
 
     private fun addLink(url: String, kind: String) {
+        val host = config ?: return
         if (links.containsKey(url)) return
         if (links.size >= 8) {
             // DHCP may leave old QR candidates behind when a new LAN address is discovered.
@@ -348,24 +378,27 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
         if (links.putIfAbsent(url, link) != null) return
         scope.launch {
             var backoff = 1000L
-            while (isActive && running && links[url] === link) {
-                val ended = CompletableDeferred<Unit>()
-                open(link, ended)
-                ended.await()
+            while (isActive && running && links[url] === link && config === host) {
+                val ended = CompletableDeferred<Boolean>()
+                open(link, host.getString("fingerprint"), ended)
+                val wasEstablished = ended.await()
                 if (links[url] !== link) break
                 synchronized(this@AgentClient) {
                     if (pairClaim == url) pairClaim = null
                 }
-                link.session = null
-                chooseLink()
+                if (wasEstablished) backoff = 1000
                 delay(backoff)
-                backoff = if (mutable.value.online) 1000 else (backoff * 2).coerceAtMost(15000)
+                backoff = if (wasEstablished) 1000 else (backoff * 2).coerceAtMost(15000)
             }
         }
     }
 
-    private fun httpClient(): OkHttpClient {
-        val pin = config?.getString("fingerprint") ?: error("未设置电脑身份")
+    @Synchronized
+    private fun httpClient(pin: String): OkHttpClient {
+        pinnedClient?.let { (fingerprint, client) ->
+            if (fingerprint == pin) return client
+            client.connectionPool.evictAll()
+        }
         val trust =
             object : X509TrustManager {
                 override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
@@ -402,6 +435,7 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
             .readTimeout(0, TimeUnit.SECONDS)
             .pingInterval(5, TimeUnit.SECONDS)
             .build()
+            .also { pinnedClient = pin to it }
     }
 
     private fun authentication(challenge: JSONObject, url: String, pairing: Boolean): JSONObject? {
@@ -473,17 +507,19 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
             }
     }
 
-    private fun open(link: Link, ended: CompletableDeferred<Unit>) {
+    private fun open(link: Link, pin: String, ended: CompletableDeferred<Boolean>) {
         val client =
-            runCatching { httpClient() }
+            runCatching { httpClient(pin) }
                 .getOrElse {
-                    ended.complete(Unit)
+                    ended.complete(false)
                     return
                 }
         link.socket =
             client.newWebSocket(
                 Request.Builder().url(link.url).build(),
                 object : WebSocketListener() {
+                    private var authenticatedAt: Long? = null
+
                     override fun onMessage(webSocket: WebSocket, text: String) {
                         if (links[link.url] !== link) return
                         if (text.toByteArray().size > 65536) {
@@ -499,6 +535,7 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
                                         else webSocket.send(auth.toString())
                                     }
                                     "authenticated" -> {
+                                        authenticatedAt = android.os.SystemClock.elapsedRealtime()
                                         link.session = value.getString("sessionId")
                                         val host = config ?: return
                                         host.remove("secret")
@@ -577,9 +614,10 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
                                     )
                             }
                         chooseLink()
-                        ended.complete(Unit)
-                        client.connectionPool.evictAll()
-                        client.dispatcher.executorService.shutdown()
+                        val established = authenticatedAt?.let {
+                            android.os.SystemClock.elapsedRealtime() - it >= 10_000
+                        } ?: false
+                        ended.complete(established)
                     }
                 },
             )
@@ -600,7 +638,7 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
                 .firstOrNull()
         if (next !== selected) {
             selected = next
-            if (next != null) scope.launch { subscribe(next) }
+            refresh()
         }
         mutable.update {
             it.copy(
@@ -686,40 +724,80 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private suspend fun subscribe(link: Link) {
+    private suspend fun reconcileSubscriptions(subscribed: MutableMap<Link, WebSocket>) {
+        val active = selected
+        val permissions = mutable.value.permissions
+        val wantsTelemetry = telemetryVisible && ("system.read" in permissions || "audio.control" in permissions)
+        for ((link, socket) in subscribed.toMap()) {
+            if (links[link.url] !== link || link.session == null || link.socket !== socket) {
+                subscribed.remove(link)
+            } else if (link !== active || !wantsTelemetry) {
+                if (subscriptionRequest(link, "session.visibility", json("foreground" to false), timeout = 1500) != null)
+                    subscribed.remove(link)
+            }
+        }
+        if (active != null && active === selected) subscribe(active, subscribed)
+    }
+
+    private suspend fun subscriptionRequest(
+        link: Link,
+        action: String,
+        payload: JSONObject = JSONObject(),
+        timeout: Long = 6000,
+    ): JSONObject? = try {
+        requestOn(link, action, payload, timeout).getJSONObject("result")
+    } catch (ex: CancellationException) {
+        throw ex
+    } catch (_: java.io.IOException) {
+        null
+    }
+
+    private suspend fun subscribe(link: Link, subscribed: MutableMap<Link, WebSocket>) {
+        val socket = link.socket ?: return
+        fun isCurrent() = selected === link && link.session != null && link.socket === socket
+        if (!isCurrent()) return
         if (link.kind == "bluetooth" && link.bluetoothCapabilities == null) {
-            val capabilities = runCatching {
-                requestOn(link, "session.hello").getJSONObject("result")
-                    .getJSONArray("capabilities").strings().toSet()
-            }.getOrNull()
+            val capabilities = subscriptionRequest(link, "session.hello")?.optJSONArray("capabilities")?.strings()?.toSet()
+            if (!isCurrent()) return
             if (capabilities != null) {
                 link.bluetoothCapabilities = capabilities
                 chooseLink()
+                catalogRefreshRequests.trySend(Unit)
             }
         }
         val permissions = mutable.value.permissions
         suspend fun get(action: String, apply: (JSONObject) -> Unit) {
-            runCatching { requestOn(link, action).getJSONObject("result") }.onSuccess(apply)
+            if (!isCurrent()) return
+            val result = subscriptionRequest(link, action)
+            if (isCurrent() && result != null) apply(result)
         }
         if ("todos.read" in permissions)
             get("todo.subscribe") { applyTodos(it.getJSONObject("snapshot")) }
-        if (visible && "system.read" in permissions) get("system.metrics.subscribe", ::applyMetrics)
-        if ("tasks.read" in permissions) refreshTemplates()
-        if (selected !== link) return
-        if (link.supports("audio") && visible && "audio.control" in permissions)
-            get("audio.state.subscribe", ::applyAudio)
-        if (link.supports("apps") && "app.launch" in permissions && selected === link) refreshApps()
+        if (!isCurrent()) return
+        if (telemetryVisible && "system.read" in permissions) {
+            subscribed[link] = socket
+            get("system.metrics.subscribe") { applyMetrics(link, it) }
+        }
+        if (link.supports("audio") && telemetryVisible && "audio.control" in permissions) {
+            subscribed[link] = socket
+            get("audio.state.subscribe") { if (telemetryVisible) applyAudio(it) }
+        }
     }
 
     private fun handleEvent(link: Link, type: String, payload: JSONObject) {
         when (type) {
             "todo.snapshot" -> if ("todos.read" in mutable.value.permissions) applyTodos(payload)
-            "system.metrics" -> applyMetrics(payload)
-            "audio.state" -> if (link === selected && "audio.control" in mutable.value.permissions) applyAudio(payload)
+            "system.metrics" -> if (link === selected) applyMetrics(link, payload)
+            "audio.state" -> if (telemetryVisible && link === selected && "audio.control" in mutable.value.permissions) applyAudio(payload)
             "app.catalog.changed" -> if (link === selected && "app.launch" in mutable.value.permissions)
-                scope.launch { refreshApps() }
+                catalogRefreshRequests.trySend(Unit)
             "permission.changed" -> {
                 val permissions = payload.getJSONArray("permissions").strings().toSet()
+                if (permissions == mutable.value.permissions) {
+                    // The server also sends this event for catalog changes.
+                    if (link === selected) catalogRefreshRequests.trySend(Unit)
+                    return
+                }
                 if ("todos.read" !in permissions) {
                     cache.clear()
                     mutable.update {
@@ -728,7 +806,8 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
                 }
                 if ("terminal.control" !in permissions) stopTerminalPolling()
                 mutable.update { it.copy(permissions = permissions) }
-                selected?.let { scope.launch { subscribe(it) } }
+                if ("system.read" !in permissions) mutableMetrics.value = MetricsState()
+                refresh()
             }
             "device.revoked" -> forget()
             "control.paused" -> mutable.update {
@@ -747,7 +826,7 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
         if (!value.has("lastSyncedAt"))
             value.put("lastSyncedAt", java.time.Instant.now().toString())
         val revision = value.getLong("revision")
-        if (revision < mutable.value.todoRevision) return
+        if (revision <= mutable.value.todoRevision) return
         val todos =
             value.getJSONArray("items").objects().map {
                 fun optionalColor(key: String) = it.optString(key).takeIf(todoHexColor::matches)
@@ -765,7 +844,9 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun applyMetrics(v: JSONObject) {
+    @Synchronized
+    private fun applyMetrics(link: Link, v: JSONObject) {
+        if (!telemetryVisible || selected !== link || "system.read" !in mutable.value.permissions) return
         val disks = v.optJSONArray("disks")?.objects()?.map { disk ->
             DiskCapacity(disk.getString("name"), disk.getLong("usedBytes"), disk.getLong("totalBytes"))
         }.orEmpty()
@@ -773,8 +854,8 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
         val network = v.optJSONObject("network")
         fun rate(section: JSONObject?, key: String): Long? =
             section?.takeUnless { it.isNull(key) }?.getLong(key)
-        mutable.update {
-            it.copy(
+        mutableMetrics.value =
+            MetricsState(
                 cpu = v.getDouble("cpuPercent"),
                 ramUsed = v.getLong("ramUsedBytes"),
                 ramTotal = v.getLong("ramTotalBytes"),
@@ -785,7 +866,6 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
                 networkReceive = rate(network, "receivedBytesPerSecond"),
                 networkSend = rate(network, "sentBytesPerSecond"),
             )
-        }
     }
 
     private fun applyAudio(v: JSONObject) {
@@ -798,9 +878,9 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private suspend fun refreshApps() {
+    private suspend fun refreshApps(link: Link) {
         runCatching {
-                request("app.catalog.get")
+                requestOn(link, "app.catalog.get")
                     .getJSONObject("result")
                     .getJSONArray("items")
                     .objects()
@@ -816,11 +896,13 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
                     }
             }
             .onSuccess { apps ->
+                if (selected !== link || "app.launch" !in mutable.value.permissions) return
                 mutable.update { it.copy(apps = apps) }
                 for (app in apps.filter { it.icon == null }) {
+                    if (selected !== link || "app.launch" !in mutable.value.permissions) return
                     runCatching {
                             val raw =
-                                request("app.icon.get", json("iconId" to app.id))
+                                requestOn(link, "app.icon.get", json("iconId" to app.id))
                                     .getJSONObject("result")
                                     .optString("dataBase64")
                             if (raw.isNotEmpty() && raw != "null") {
@@ -830,6 +912,7 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
                         }
                         .getOrNull()
                         ?.let { bitmap ->
+                            if (selected !== link || "app.launch" !in mutable.value.permissions) return
                             mutable.update {
                                 it.copy(
                                     apps =
@@ -844,12 +927,11 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
             }
     }
 
-    private suspend fun refreshTemplates() {
-        runCatching { request("task.templates").getJSONObject("result") }
-            .onSuccess { value ->
-                mutable.update {
-                    it.copy(templates = value.getJSONArray("items").objects())
-                }
+    private suspend fun refreshTemplates(link: Link) {
+        runCatching { requestOn(link, "task.templates").getJSONObject("result").getJSONArray("items").objects() }
+            .onSuccess { templates ->
+                if (selected === link && "tasks.read" in mutable.value.permissions)
+                    mutable.update { it.copy(templates = templates) }
             }
     }
 
@@ -878,7 +960,14 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
     }
 
     fun refresh() {
-        selected?.let { scope.launch { subscribe(it) } }
+        refreshRequests.trySend(Unit)
+        catalogRefreshRequests.trySend(Unit)
+    }
+
+    internal fun setDisplayBlanked(blanked: Boolean) {
+        if (displayBlanked == blanked) return
+        displayBlanked = blanked
+        refreshRequests.trySend(Unit)
     }
 
     fun completeTodo(id: String) = action {
@@ -891,14 +980,11 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
 
     fun foreground(visible: Boolean) {
         this.visible = visible
+        refresh()
         action(false) {
-            links.values
-                .filter { it.session != null }
-                .forEach { requestOn(it, "session.visibility", json("foreground" to visible)) }
             if (visible) {
                 retryBluetooth()
                 startDiscovery()
-                refresh()
             }
         }
     }
@@ -1112,6 +1198,7 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
         )
     }
 
+    @Synchronized
     private fun disconnect() {
         stopBluetooth()
         discovery?.let { runCatching { nsd.stopServiceDiscovery(it) } }
@@ -1121,7 +1208,9 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
         pairClaim = null
         previousLinks.forEach { it.socket?.cancel() }
         selected = null
-        pending.values.forEach { it.completion.cancel() }
+        mutableMetrics.value = MetricsState()
+        refresh()
+        pending.values.forEach { it.completion.completeExceptionally(java.io.IOException("连接已中断")) }
         pending.clear()
     }
 

@@ -38,9 +38,9 @@ internal class TerminalBridge(
 }
 
 @Composable
-internal fun TerminalScreen(state: UiState, client: AgentClient, onClose: () -> Unit) {
+internal fun TerminalScreen(state: UiState, client: AgentClient, onInput: () -> Unit, onClose: () -> Unit) {
     if ("terminal.control" in state.permissions) {
-        TerminalSession(state, client, onClose)
+        TerminalSession(state, client, onInput, onClose)
     } else {
         Panel("PowerShell") {
             Text(if (state.online) "请在电脑「手机与权限」开启「PowerShell 终端」" else "电脑离线")
@@ -50,7 +50,7 @@ internal fun TerminalScreen(state: UiState, client: AgentClient, onClose: () -> 
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-private fun TerminalSession(state: UiState, client: AgentClient, onClose: () -> Unit) {
+private fun TerminalSession(state: UiState, client: AgentClient, onInput: () -> Unit, onClose: () -> Unit) {
     val assets = LocalContext.current.assets
     var browser by remember { mutableStateOf<WebView?>(null) }
     var viewport by remember { mutableStateOf<Pair<Int, Int>?>(null) }
@@ -68,6 +68,7 @@ private fun TerminalSession(state: UiState, client: AgentClient, onClose: () -> 
     }
     val canType = firstFrameReady && state.online && state.terminalRunning && !state.paused
     val sendInput: (String) -> Unit = { text ->
+        onInput()
         browser?.evaluateJavascript("terminal.scrollToBottom();", null)
         client.terminalWrite(text)
     }
@@ -133,7 +134,10 @@ private fun TerminalSession(state: UiState, client: AgentClient, onClose: () -> 
                             val view = this
                             addJavascriptInterface(
                                 TerminalBridge(
-                                    input = client::terminalWrite,
+                                    input = { text ->
+                                        view.post { onInput() }
+                                        client.terminalWrite(text)
+                                    },
                                     viewport = { columns, rows -> view.post { viewport = columns to rows } },
                                     firstOutput = {
                                         view.post {

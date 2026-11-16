@@ -7,13 +7,19 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.WindowManager
+import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
@@ -33,10 +39,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
@@ -51,25 +60,47 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.viewmodel.compose.viewModel
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.common.InputImage
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : ComponentActivity() {
+    private val client: AgentClient by viewModels()
+    private val idleHandler = Handler(Looper.getMainLooper())
+    private val blankScreen = Runnable { showBlankScreen(true) }
+    private lateinit var content: ComposeView
+    private lateinit var blackScreen: View
+    private var displaySettings by mutableStateOf(DisplaySettings())
+    private var screenBlanked by mutableStateOf(false)
+    private var idleTimerBlocked = false
+    private var touchInProgress = false
+    private var resumed = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val preferences = getPreferences(MODE_PRIVATE)
+        displaySettings = DisplaySettings(
+            enabled = preferences.getBoolean("burnInProtection", true),
+            idleMinutes = preferences.getInt("burnInIdleMinutes", defaultIdleMinutes)
+                .takeIf { it in idleMinuteOptions } ?: defaultIdleMinutes,
+        )
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         window.attributes = window.attributes.apply {
             layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
         }
         hideSystemBars()
-        setContent {
-            MaterialTheme(
-                colorScheme =
-                    lightColorScheme(
+        blackScreen = View(this).apply {
+            visibility = View.GONE
+            setBackgroundColor(android.graphics.Color.BLACK)
+            contentDescription = "轻触恢复显示"
+            setOnClickListener { showBlankScreen(false) }
+        }
+        content = ComposeView(this).apply {
+            setContent {
+                MaterialTheme(
+                    colorScheme = lightColorScheme(
                         primary = Color(0xFF245BC2),
                         onPrimary = Color.White,
                         secondaryContainer = Color(0xFFE6EFFF),
@@ -79,18 +110,91 @@ class MainActivity : ComponentActivity() {
                         onSurface = Color(0xFF18243A),
                         onSurfaceVariant = Color(0xFF54637A),
                         outlineVariant = Color(0xFFDCE3EE),
-                    )
-            ) {
-                Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    CompanionScreen()
+                    ),
+                ) {
+                    Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                        CompanionScreen(
+                            client, displaySettings, screenBlanked, ::saveDisplaySettings, ::setIdleTimerBlocked, ::resetIdleTimer,
+                        )
+                        BackHandler(enabled = screenBlanked) { showBlankScreen(false) }
+                    }
                 }
             }
         }
+        setContentView(FrameLayout(this).apply {
+            addView(content, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+            addView(blackScreen, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+        })
+    }
+
+    override fun onResume() {
+        super.onResume()
+        resumed = true
+        showBlankScreen(false)
+    }
+
+    override fun onPause() {
+        resumed = false
+        idleHandler.removeCallbacks(blankScreen)
+        touchInProgress = false
+        super.onPause()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) hideSystemBars()
+        resetIdleTimer()
+    }
+
+    override fun onUserInteraction() {
+        super.onUserInteraction()
+        resetIdleTimer()
+    }
+
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> touchInProgress = true
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> touchInProgress = false
+            else -> return super.dispatchTouchEvent(event)
+        }
+        resetIdleTimer()
+        return super.dispatchTouchEvent(event)
+    }
+
+    private fun saveDisplaySettings(settings: DisplaySettings) {
+        displaySettings = settings
+        getPreferences(MODE_PRIVATE).edit()
+            .putBoolean("burnInProtection", settings.enabled)
+            .putInt("burnInIdleMinutes", settings.idleMinutes)
+            .apply()
+        resetIdleTimer()
+    }
+
+    private fun setIdleTimerBlocked(blocked: Boolean) {
+        if (idleTimerBlocked == blocked) return
+        idleTimerBlocked = blocked
+        resetIdleTimer()
+    }
+
+    private fun resetIdleTimer() {
+        idleHandler.removeCallbacks(blankScreen)
+        if (!resumed || !hasWindowFocus() || screenBlanked ||
+            !displaySettings.enabled || idleTimerBlocked || touchInProgress
+        ) return
+        idleHandler.postDelayed(blankScreen, displaySettings.idleMinutes * 60_000L)
+    }
+
+    private fun showBlankScreen(blanked: Boolean) {
+        if (blanked) {
+            WindowCompat.getInsetsController(window, window.decorView).hide(WindowInsetsCompat.Type.ime())
+            hideSystemBars()
+        }
+        // Keep the current page mounted while the black view handles the wake-up tap.
+        screenBlanked = blanked
+        content.visibility = if (blanked) View.INVISIBLE else View.VISIBLE
+        blackScreen.visibility = if (blanked) View.VISIBLE else View.GONE
+        client.setDisplayBlanked(blanked)
+        if (!blanked) resetIdleTimer()
     }
 
     private fun hideSystemBars() {
@@ -101,18 +205,30 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private const val defaultIdleMinutes = 3
+private val idleMinuteOptions = listOf(1, 3, 5, 10, 15, 30)
+private data class DisplaySettings(val enabled: Boolean = true, val idleMinutes: Int = defaultIdleMinutes)
+
 private enum class Page { Home, Terminal, Performance, Audio, Apps, Scripts, Settings }
 private val headerHeight = 34.dp
 private val screenVerticalPadding = 3.dp
 private val pageGap = 4.dp
 
 @Composable
-private fun CompanionScreen(client: AgentClient = viewModel()) {
+private fun CompanionScreen(
+    client: AgentClient,
+    displaySettings: DisplaySettings,
+    screenBlanked: Boolean,
+    onDisplaySettingsChange: (DisplaySettings) -> Unit,
+    onIdleTimerBlocked: (Boolean) -> Unit,
+    onTerminalInput: () -> Unit,
+) {
     val state by client.state.collectAsStateWithLifecycle()
     var scanning by remember { mutableStateOf(false) }
     var page by remember { mutableStateOf(Page.Home) }
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current
+    SideEffect { onIdleTimerBlocked(scanning || state.pairingCode.isNotEmpty()) }
     val cameraPermission =
         rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             if (granted) scanning = true else client.report("需要相机权限才能扫描配对码")
@@ -197,8 +313,10 @@ private fun CompanionScreen(client: AgentClient = viewModel()) {
                         onClose = { scanning = false },
                         onError = client::report,
                     )
-                    page == Page.Terminal -> TerminalScreen(state, client) { navigate(Page.Home) }
-                    page == Page.Settings -> SettingsScreen(state, scan, selectBluetooth) {
+                    page == Page.Terminal -> TerminalScreen(state, client, onTerminalInput) { navigate(Page.Home) }
+                    page == Page.Settings -> SettingsScreen(
+                        state, displaySettings, onDisplaySettingsChange, scan, selectBluetooth,
+                    ) {
                         navigate(Page.Home)
                         client.unpair()
                     }
@@ -222,7 +340,7 @@ private fun CompanionScreen(client: AgentClient = viewModel()) {
             }
         }
     }
-    if ((page != Page.Terminal || scanning) && state.error.isNotEmpty())
+    if (!screenBlanked && (page != Page.Terminal || scanning) && state.error.isNotEmpty())
         AlertDialog(
             onDismissRequest = client::clearError,
             text = { Text(state.error) },
@@ -316,7 +434,7 @@ private fun Dashboard(state: UiState, client: AgentClient, page: Page) {
                 Page.Audio -> ToolPanel(state.supportsAudio, "音量与媒体") { AudioCard(state, client) }
                 Page.Apps -> ToolPanel(state.supportsApps, "应用") { AppCard(state, client) }
                 Page.Scripts -> ScriptsScreen(state, client)
-                else -> SystemCard(state, "电脑状态", Modifier.fillMaxSize())
+                else -> SystemCard(state.online, client, Modifier.fillMaxSize())
             }
         }
     }
@@ -509,45 +627,74 @@ private fun transferRate(bytes: Long?): String = when {
 }
 
 @Composable
-private fun SystemCard(state: UiState, title: String, modifier: Modifier = Modifier) {
-    Panel(title, modifier, headerAction = {
-        if (!state.online) Text("离线", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+private fun SystemCard(online: Boolean, client: AgentClient, modifier: Modifier = Modifier) {
+    val metrics = client.metrics.collectAsStateWithLifecycle()
+    val hasMetrics by remember(metrics) { derivedStateOf(structuralEqualityPolicy()) { metrics.value.ramTotal != 0L } }
+    Panel("电脑状态", modifier, headerAction = {
+        if (!online) Text("离线", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }) {
-        if (state.ramTotal == 0L) {
+        if (!hasMetrics) {
             Text("等待电脑性能数据", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             return@Panel
         }
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            UsageMeter(
-                "CPU", "${"%.0f".format(state.cpu)}%", (state.cpu / 100).toFloat(),
-                Modifier.weight(1f),
-            )
-            UsageMeter(
-                "内存", "${gib(state.ramUsed)} / ${gib(state.ramTotal)} GiB",
-                (state.ramUsed.toDouble() / state.ramTotal.coerceAtLeast(1)).toFloat(),
-                Modifier.weight(1f),
-            )
+            CpuMeter(metrics, Modifier.weight(1f))
+            MemoryMeter(metrics, Modifier.weight(1f))
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            RateTile("磁盘 I/O", "读", state.diskRead, "写", state.diskWrite, Modifier.weight(1f))
-            RateTile("网络吞吐", "↓", state.networkReceive, "↑", state.networkSend, Modifier.weight(1f))
+            TransferMeter(metrics, isDisk = true, Modifier.weight(1f))
+            TransferMeter(metrics, isDisk = false, Modifier.weight(1f))
         }
         Text("磁盘 · 已用 / 总量", fontSize = 11.sp, lineHeight = 15.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        if (state.disks.isEmpty()) Text("可用 ${gib(state.diskFree)} GiB", fontSize = 12.sp)
-        else {
-            LazyColumn(
-                Modifier.weight(1f).fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
-                contentPadding = PaddingValues(bottom = 2.dp),
-            ) {
-                items(state.disks, key = { it.name }) { disk ->
-                    UsageMeter(
-                        disk.name, "${gib(disk.usedBytes)} / ${gib(disk.totalBytes)} GiB",
-                        (disk.usedBytes.toDouble() / disk.totalBytes.coerceAtLeast(1)).toFloat(),
-                        Modifier.fillMaxWidth().heightIn(min = 22.dp),
-                    )
-                }
-            }
+        DiskMeters(metrics, Modifier.weight(1f).fillMaxWidth())
+    }
+}
+
+@Composable
+private fun CpuMeter(metrics: State<MetricsState>, modifier: Modifier) {
+    val percent by remember(metrics) {
+        derivedStateOf(structuralEqualityPolicy()) { kotlin.math.round(metrics.value.cpu).toInt() }
+    }
+    UsageMeter("CPU", "$percent%", percent / 100f, modifier)
+}
+
+private data class UsageReading(val name: String, val text: String, val progress: Float)
+
+private fun usageReading(name: String, used: Long, total: Long): UsageReading {
+    val fraction = used.toDouble() / total.coerceAtLeast(1)
+    return UsageReading(name, "${gib(used)} / ${gib(total)} GiB", (kotlin.math.round(fraction * 1000) / 1000).toFloat())
+}
+
+@Composable
+private fun MemoryMeter(metrics: State<MetricsState>, modifier: Modifier) {
+    val reading by remember(metrics) {
+        derivedStateOf(structuralEqualityPolicy()) {
+            val state = metrics.value
+            usageReading("内存", state.ramUsed, state.ramTotal)
+        }
+    }
+    UsageMeter(reading.name, reading.text, reading.progress, modifier)
+}
+
+@Composable
+private fun DiskMeters(metrics: State<MetricsState>, modifier: Modifier) {
+    val disks by remember(metrics) {
+        derivedStateOf(structuralEqualityPolicy()) {
+            metrics.value.disks.map { usageReading(it.name, it.usedBytes, it.totalBytes) }
+        }
+    }
+    if (disks.isEmpty()) {
+        val diskFree by remember(metrics) { derivedStateOf(structuralEqualityPolicy()) { gib(metrics.value.diskFree) } }
+        Text("可用 $diskFree GiB", fontSize = 12.sp)
+        return
+    }
+    LazyColumn(
+        modifier,
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+        contentPadding = PaddingValues(bottom = 2.dp),
+    ) {
+        items(disks, key = { it.name }) { disk ->
+            UsageMeter(disk.name, disk.text, disk.progress, Modifier.fillMaxWidth().heightIn(min = 22.dp))
         }
     }
 }
@@ -572,16 +719,20 @@ private fun UsageMeter(label: String, value: String, progress: Float, modifier: 
 }
 
 @Composable
-private fun RateTile(
-    title: String, first: String, firstRate: Long?, second: String, secondRate: Long?,
-    modifier: Modifier,
-) {
+private fun TransferMeter(metrics: State<MetricsState>, isDisk: Boolean, modifier: Modifier) {
+    val rates by remember(metrics, isDisk) {
+        derivedStateOf(structuralEqualityPolicy()) {
+            val state = metrics.value
+            if (isDisk) transferRate(state.diskRead) to transferRate(state.diskWrite)
+            else transferRate(state.networkReceive) to transferRate(state.networkSend)
+        }
+    }
     Surface(modifier, shape = RoundedCornerShape(8.dp), color = MaterialTheme.colorScheme.background) {
         Column(Modifier.padding(horizontal = 8.dp, vertical = 5.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            Text(title, fontSize = 10.sp, lineHeight = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(if (isDisk) "磁盘 I/O" else "网络吞吐", fontSize = 10.sp, lineHeight = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("$first ${transferRate(firstRate)}", Modifier.weight(1f), fontSize = 10.sp, lineHeight = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text("$second ${transferRate(secondRate)}", Modifier.weight(1f), fontSize = 10.sp, lineHeight = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text("${if (isDisk) "读" else "↓"} ${rates.first}", Modifier.weight(1f), fontSize = 10.sp, lineHeight = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text("${if (isDisk) "写" else "↑"} ${rates.second}", Modifier.weight(1f), fontSize = 10.sp, lineHeight = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
     }
@@ -590,6 +741,8 @@ private fun RateTile(
 @Composable
 private fun SettingsScreen(
     state: UiState,
+    displaySettings: DisplaySettings,
+    onDisplaySettingsChange: (DisplaySettings) -> Unit,
     onScan: () -> Unit,
     onBluetooth: () -> Unit,
     onUnpair: () -> Unit,
@@ -605,6 +758,39 @@ private fun SettingsScreen(
                         onClick = onUnpair,
                         colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
                     ) { Text("解除配对", fontSize = 12.sp) }
+            }
+        }
+        BurnInSettings(displaySettings, onDisplaySettingsChange)
+    }
+}
+
+@Composable
+private fun BurnInSettings(settings: DisplaySettings, onChange: (DisplaySettings) -> Unit) {
+    var choosingTime by remember { mutableStateOf(false) }
+    Panel("防烧屏", headerAction = {
+        Switch(
+            checked = settings.enabled,
+            onCheckedChange = { onChange(settings.copy(enabled = it)) },
+            modifier = Modifier.semantics { contentDescription = "防烧屏" },
+        )
+    }) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                Text("闲置时间", fontSize = 12.sp)
+                Text("闲置后全屏变黑，轻触恢复", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Box {
+                OutlinedButton(onClick = { choosingTime = true }, enabled = settings.enabled) {
+                    Text("${settings.idleMinutes} 分钟", fontSize = 12.sp)
+                }
+                DropdownMenu(expanded = choosingTime, onDismissRequest = { choosingTime = false }) {
+                    for (minutes in idleMinuteOptions) {
+                        DropdownMenuItem(text = { Text("$minutes 分钟") }, onClick = {
+                            choosingTime = false
+                            onChange(settings.copy(idleMinutes = minutes))
+                        })
+                    }
+                }
             }
         }
     }
