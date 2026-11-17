@@ -810,6 +810,7 @@ private fun Scanner(onCode: (String) -> Unit, onClose: () -> Unit, onError: (Str
         var provider: ProcessCameraProvider? = null
         future.addListener(
             {
+                if (consumed.get()) return@addListener
                 runCatching {
                         provider = future.get()
                         val cameraPreview =

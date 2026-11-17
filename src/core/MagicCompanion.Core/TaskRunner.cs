@@ -22,12 +22,25 @@ public sealed class TaskRunner(AgentStore store) : IDisposable, IAsyncDisposable
     private sealed record SavedJob(string Owner, TaskJob Job);
 
     private readonly object startGate = new();
+    private bool disposed;
     public event Action<string, TaskJob>? Changed;
-    public TaskTemplate[] Templates =>
-        JsonSerializer.Deserialize<TaskTemplate[]>(
-            store.GetSetting("taskTemplates") ?? "[]",
-            Wire.Json
-        ) ?? [];
+    public TaskTemplate[] Templates => ParseTemplates(store.GetSetting("taskTemplates") ?? "[]");
+
+    public static TaskTemplate[] ParseTemplates(string json)
+    {
+        TaskTemplate[] templates;
+        try { templates = JsonSerializer.Deserialize<TaskTemplate[]>(json, Wire.Json) ?? []; }
+        catch (JsonException) { throw new AgentException("INVALID_ARGUMENT", "任务预设需为 JSON 数组"); }
+        if (templates.Length > 30)
+            throw new AgentException("INVALID_ARGUMENT", "最多配置 30 个任务");
+        if (templates.Any(t => t == null || string.IsNullOrWhiteSpace(t.Id) || t.Id.Length > 128
+            || string.IsNullOrWhiteSpace(t.Name) || t.Arguments == null || t.Arguments.Any(a => a == null)
+            || t.ParameterPatterns?.Any(p => string.IsNullOrWhiteSpace(p.Key) || p.Value == null) == true))
+            throw new AgentException("INVALID_ARGUMENT", "每个任务需填写有效的 id、name 和 arguments");
+        if (templates.Select(t => t.Id).Distinct(StringComparer.Ordinal).Count() != templates.Length)
+            throw new AgentException("INVALID_ARGUMENT", "任务 id 不能重复");
+        return templates;
+    }
     public TaskJob Start(string deviceId, string templateId, JsonElement parameters, bool locked = false)
     {
         lock (startGate)
@@ -36,6 +49,7 @@ public sealed class TaskRunner(AgentStore store) : IDisposable, IAsyncDisposable
 
     private TaskJob StartInternal(string deviceId, string templateId, JsonElement parameters, bool locked)
     {
+        ObjectDisposedException.ThrowIf(disposed, this);
         var template =
             Templates.FirstOrDefault(t => t.Id == templateId)
             ?? throw new AgentException("INVALID_ARGUMENT", "任务模板不存在");
@@ -117,6 +131,7 @@ public sealed class TaskRunner(AgentStore store) : IDisposable, IAsyncDisposable
         var running = new Running(job, deviceId);
         jobs[job.JobId] = running;
         Persist(running);
+        PruneHistory();
         running.Completion = ExecuteAsync(info, running);
         return job;
     }
@@ -135,11 +150,11 @@ public sealed class TaskRunner(AgentStore store) : IDisposable, IAsyncDisposable
             timeout.CancelAfter(
                 TimeSpan.FromSeconds(Math.Clamp(template?.TimeoutSeconds ?? 300, 1, 3600))
             );
-            var stdout = ReadAsync(process.StandardOutput, job);
-            var stderr = ReadAsync(process.StandardError, job);
+            var stdout = ReadAsync(process.StandardOutput, job, timeout.Token);
+            var stderr = ReadAsync(process.StandardError, job, timeout.Token);
             try
             {
-                await process.WaitForExitAsync(timeout.Token);
+                await Task.WhenAll(process.WaitForExitAsync(timeout.Token), stdout, stderr);
             }
             catch (OperationCanceledException)
             {
@@ -150,7 +165,6 @@ public sealed class TaskRunner(AgentStore store) : IDisposable, IAsyncDisposable
                 catch (InvalidOperationException) { }
                 await process.WaitForExitAsync();
             }
-            await Task.WhenAll(stdout, stderr);
             Update(
                 job,
                 timeout.IsCancellationRequested ? "cancelled"
@@ -171,13 +185,13 @@ public sealed class TaskRunner(AgentStore store) : IDisposable, IAsyncDisposable
         }
     }
 
-    private async Task ReadAsync(StreamReader reader, Running job)
+    private async Task ReadAsync(StreamReader reader, Running job, CancellationToken cancellation)
     {
         var buffer = new char[4096];
         var pending = "";
         while (true)
         {
-            var count = await reader.ReadAsync(buffer);
+            var count = await reader.ReadAsync(buffer.AsMemory(), cancellation);
             if (count == 0)
                 break;
             pending += new string(buffer, 0, count);
@@ -220,7 +234,21 @@ public sealed class TaskRunner(AgentStore store) : IDisposable, IAsyncDisposable
                 Lines = job.Lines.ToArray(),
             };
         Persist(job);
+        PruneHistory();
         Changed?.Invoke(job.Owner, job.Snapshot);
+    }
+
+    private void PruneHistory()
+    {
+        lock (startGate)
+        {
+            foreach (var job in jobs.Values.Where(j => j.Snapshot.State != "running")
+                .OrderByDescending(j => j.Snapshot.StartedAt, StringComparer.Ordinal).Skip(100).ToArray())
+                if (jobs.TryRemove(job.Snapshot.JobId, out _))
+                    job.Cancellation.Dispose();
+            store.PruneJobHistory(jobs.Values.Where(j => j.Snapshot.State == "running")
+                .Select(j => j.Snapshot.JobId), 100);
+        }
     }
 
     private void Persist(Running job) =>
@@ -258,25 +286,38 @@ public sealed class TaskRunner(AgentStore store) : IDisposable, IAsyncDisposable
 
     public TaskJob Cancel(string device, string id, bool locked = false)
     {
-        var current = Get(device, id);
-        if (locked && !Templates.Any(t => t.Id == current.TemplateId && t.AllowWhileLocked))
-            throw new AgentException("PERMISSION_DENIED", "此脚本未获准在锁屏时操作");
-        if (jobs.TryGetValue(id, out var running) && current.State == "running")
-            running.Cancellation.Cancel();
-        return current;
+        lock (startGate)
+        {
+            var current = Get(device, id);
+            if (locked && !Templates.Any(t => t.Id == current.TemplateId && t.AllowWhileLocked))
+                throw new AgentException("PERMISSION_DENIED", "此脚本未获准在锁屏时操作");
+            if (jobs.TryGetValue(id, out var running) && current.State == "running")
+                running.Cancellation.Cancel();
+            return current;
+        }
     }
 
     public void Dispose()
     {
-        foreach (var job in jobs.Values)
-            job.Cancellation.Cancel();
+        lock (startGate)
+        {
+            if (disposed) return;
+            disposed = true;
+            foreach (var job in jobs.Values)
+                job.Cancellation.Cancel();
+        }
     }
 
     public async ValueTask DisposeAsync()
     {
-        Dispose();
-        await Task.WhenAll(jobs.Values.Select(j => j.Completion));
-        foreach (var job in jobs.Values)
+        Running[] remaining;
+        lock (startGate)
+        {
+            remaining = jobs.Values.ToArray();
+            Dispose();
+        }
+        await Task.WhenAll(remaining.Select(j => j.Completion));
+        foreach (var job in remaining)
             job.Cancellation.Dispose();
     }
 }

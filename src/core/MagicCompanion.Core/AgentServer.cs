@@ -36,12 +36,13 @@ public sealed class AgentServer : IAsyncDisposable
             }
         );
 
-        public bool Event(string type, object payload) =>
-            (!Bluetooth || type is "todo.snapshot" or "system.metrics" or "permission.changed"
+        public bool Event(string type, object payload)
+        {
+            if (Bluetooth && type is not ("todo.snapshot" or "system.metrics" or "permission.changed"
                 or "device.revoked" or "task.updated" or "control.paused"
-                or "app.catalog.changed" or "audio.state")
-            &&
-            Out.Writer.TryWrite(
+                or "app.catalog.changed" or "audio.state"))
+                return false;
+            if (Out.Writer.TryWrite(
                 Wire.Serialize(
                     new
                     {
@@ -51,7 +52,12 @@ public sealed class AgentServer : IAsyncDisposable
                         payload,
                     }
                 )
-            );
+            )) return true;
+            // Reconnect and resubscribe instead of leaving the phone on an old snapshot.
+            Out.Writer.TryComplete();
+            Socket.Abort();
+            return false;
+        }
 
         public void Revoke()
         {
@@ -66,6 +72,7 @@ public sealed class AgentServer : IAsyncDisposable
     private readonly IAgentPlatform platform;
     private readonly PairingCoordinator pairing;
     private readonly TaskRunner tasks;
+    private readonly bool ownsTasks;
     private readonly ITerminalPlatform? terminal;
     private readonly string hostId;
     private readonly ConcurrentDictionary<string, Client> clients = new();
@@ -92,7 +99,8 @@ public sealed class AgentServer : IAsyncDisposable
         IAgentPlatform platform,
         PairingCoordinator pairing,
         string hostId,
-        ITerminalPlatform? terminal = null
+        ITerminalPlatform? terminal = null,
+        TaskRunner? taskRunner = null
     )
     {
         this.store = store;
@@ -100,7 +108,8 @@ public sealed class AgentServer : IAsyncDisposable
         this.pairing = pairing;
         this.hostId = hostId;
         this.terminal = terminal;
-        tasks = new(store);
+        tasks = taskRunner ?? new(store);
+        ownsTasks = taskRunner == null;
         store.TodosChanged += OnTodos;
         store.ConfigurationChanged += OnConfiguration;
         tasks.Changed += OnTask;
@@ -797,7 +806,9 @@ public sealed class AgentServer : IAsyncDisposable
         }
         if (publisher != null)
             await publisher;
-        await tasks.DisposeAsync();
+        tasks.Changed -= OnTask;
+        if (ownsTasks)
+            await tasks.DisposeAsync();
         terminal?.Dispose();
         if (app != null)
             await app.DisposeAsync();

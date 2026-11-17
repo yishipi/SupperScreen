@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Net.WebSockets;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
@@ -12,6 +13,38 @@ namespace MagicCompanion.Tests;
 
 public sealed class ServerTests
 {
+    [Fact]
+    public void EventBackpressureAbortsTheLinkSoThePhoneCanResubscribe()
+    {
+        using var socket = new ClientWebSocket();
+        var clientType = typeof(AgentServer).GetNestedType("Client", BindingFlags.NonPublic)!;
+        var client = Activator.CreateInstance(clientType, socket, "phone", "session", false)!;
+        var emit = clientType.GetMethod("Event")!;
+        var queued = true;
+        for (var count = 0; count < 1000 && queued; count++)
+            queued = (bool)emit.Invoke(client, ["todo.snapshot", new { revision = count }])!;
+        Assert.False(queued);
+        Assert.Equal(WebSocketState.Closed, socket.State);
+    }
+
+    [Fact]
+    public async Task ReplacingAListenerPreservesItsExternallyOwnedTasks()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        using var store = new AgentStore(":memory:");
+        var template = new TaskTemplate("wait", "Wait", Path.Combine(Environment.SystemDirectory, "cmd.exe"),
+            ["/d", "/c", "ping -n 3 127.0.0.1 >nul"], Path.GetTempPath(), 10);
+        store.SetSetting("taskTemplates", Wire.Serialize(new[] { template }));
+        await using var runner = new TaskRunner(store);
+        var job = runner.Start("phone", template.Id, default);
+        var listener = new AgentServer(store, new FakePlatform(), new(store, "host"), "host", taskRunner: runner);
+        await listener.DisposeAsync();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        while (runner.Get("phone", job.JobId).State == "running")
+            await Task.Delay(50, timeout.Token);
+        Assert.Equal("succeeded", runner.Get("phone", job.JobId).State);
+    }
+
     [Fact]
     public async Task RealTlsSocketsShareIdentityDedupeAndReadOnlyTodoSubscription()
     {

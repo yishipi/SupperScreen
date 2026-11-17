@@ -82,6 +82,22 @@ public sealed class AgentStore : IDisposable
         if (key == "taskTemplates") ConfigurationChanged?.Invoke();
     }
 
+    public void PruneJobHistory(IEnumerable<string> activeJobIds, int keep)
+    {
+        lock (gate)
+        {
+            using var command = db.CreateCommand();
+            var active = activeJobIds.Select((id, index) => (Key: "$job" + index, Value: "job:" + id)).ToArray();
+            foreach (var (key, value) in active)
+                command.Parameters.AddWithValue(key, value);
+            var excludeActive = active.Length == 0 ? "" : " AND key NOT IN (" + string.Join(",", active.Select(p => p.Key)) + ")";
+            command.CommandText = "DELETE FROM settings WHERE key IN (SELECT key FROM settings WHERE key LIKE 'job:%'"
+                + excludeActive + " ORDER BY rowid DESC LIMIT -1 OFFSET $keep)";
+            command.Parameters.AddWithValue("$keep", keep);
+            command.ExecuteNonQuery();
+        }
+    }
+
     public TodoSnapshot Todos()
     {
         lock (gate)

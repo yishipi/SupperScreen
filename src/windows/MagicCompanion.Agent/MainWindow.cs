@@ -15,6 +15,7 @@ namespace MagicCompanion.Agent;
 internal sealed partial class MainWindow : Window
 {
     private readonly AgentStore store;
+    private readonly TaskRunner tasks;
     private readonly HostIdentity identity;
     private readonly WindowsPlatform platform;
     private readonly PairingCoordinator pairing;
@@ -81,6 +82,7 @@ internal sealed partial class MainWindow : Window
                 );
         Directory.CreateDirectory(dataDirectory);
         store = new(Path.Combine(dataDirectory, "agent.db"));
+        tasks = new(store);
         allowLockedAudio = store.GetSetting("allowLockedAudio") == "true";
         identity = new(store, dataDirectory);
         platform = new();
@@ -183,11 +185,12 @@ internal sealed partial class MainWindow : Window
                 server == null
                     ? "服务未启动"
                     : $"{Environment.MachineName} · {(server.LinkCount > 0 ? "手机已连接" : "等待手机")} · {(server.ControlPaused ? "控制已暂停" : "服务就绪")}";
-            if (restartingServer || server == null || Environment.TickCount64 < nextConnectionCheck)
+            if (restartingServer || Environment.TickCount64 < nextConnectionCheck)
                 return;
             nextConnectionCheck = Environment.TickCount64 + 5000;
             var addresses = LanAddresses();
-            if (!configuredLanAddresses.SequenceEqual(addresses))
+            if (server == null || !configuredLanAddresses.SequenceEqual(addresses)
+                || !activeLanAddresses.SequenceEqual(addresses) && CanBindLan(addresses))
                 await StartServer(addresses);
             else
                 await StartBluetooth();
@@ -586,11 +589,7 @@ internal sealed partial class MainWindow : Window
                 () =>
                     Try(() =>
                     {
-                        var tasks =
-                            JsonSerializer.Deserialize<TaskTemplate[]>(templates.Text, Wire.Json)
-                            ?? [];
-                        if (tasks.Length > 30)
-                            throw new AgentException("INVALID_ARGUMENT", "最多配置 30 个任务");
+                        var tasks = TaskRunner.ParseTemplates(templates.Text);
                         foreach (var t in tasks)
                         {
                             if (
@@ -621,7 +620,7 @@ internal sealed partial class MainWindow : Window
         if (string.IsNullOrWhiteSpace(name)) return;
         Try(() =>
         {
-            var templates = JsonSerializer.Deserialize<TaskTemplate[]>(store.GetSetting("taskTemplates") ?? "[]", Wire.Json) ?? [];
+            var templates = TaskRunner.ParseTemplates(store.GetSetting("taskTemplates") ?? "[]");
             if (templates.Length >= 30) throw new AgentException("INVALID_ARGUMENT", "最多配置 30 个任务");
             var script = PowerShellTerminal.Script(name.Trim(), picker.FileName);
             store.SetSetting("taskTemplates", Wire.Serialize(templates.Append(script).ToArray()));
@@ -630,16 +629,16 @@ internal sealed partial class MainWindow : Window
         });
     }
 
-    private void RenderScripts()
+    private void RenderScripts() => Try(() =>
     {
         scriptRows.Children.Clear();
-        var templates = JsonSerializer.Deserialize<TaskTemplate[]>(store.GetSetting("taskTemplates") ?? "[]", Wire.Json) ?? [];
+        var templates = TaskRunner.ParseTemplates(store.GetSetting("taskTemplates") ?? "[]");
         foreach (var template in templates)
         {
             var row = new DockPanel();
             var remove = Button("移除", () => Try(() =>
             {
-                var saved = JsonSerializer.Deserialize<TaskTemplate[]>(store.GetSetting("taskTemplates") ?? "[]", Wire.Json) ?? [];
+                var saved = TaskRunner.ParseTemplates(store.GetSetting("taskTemplates") ?? "[]");
                 store.SetSetting("taskTemplates", Wire.Serialize(saved.Where(t => t.Id != template.Id).ToArray()));
                 scriptJson.Text = store.GetSetting("taskTemplates")!;
                 RenderScripts();
@@ -654,7 +653,7 @@ internal sealed partial class MainWindow : Window
             };
             locked.Click += (_, _) => Try(() =>
             {
-                var saved = JsonSerializer.Deserialize<TaskTemplate[]>(store.GetSetting("taskTemplates") ?? "[]", Wire.Json) ?? [];
+                var saved = TaskRunner.ParseTemplates(store.GetSetting("taskTemplates") ?? "[]");
                 store.SetSetting("taskTemplates", Wire.Serialize(saved.Select(t =>
                     t.Id == template.Id ? t with { AllowWhileLocked = locked.IsChecked == true } : t).ToArray()));
                 scriptJson.Text = store.GetSetting("taskTemplates")!;
@@ -664,7 +663,7 @@ internal sealed partial class MainWindow : Window
             row.Children.Add(new TextBlock { Text = template.Name, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(12, 0, 0, 0) });
             scriptRows.Children.Add(Card(row));
         }
-    }
+    });
 
     private bool LanEnabled =>
         store.GetSetting("lanEnabled") switch
@@ -675,6 +674,22 @@ internal sealed partial class MainWindow : Window
         };
 
     private IPAddress[] LanAddresses() => LanEnabled ? HostIdentity.LocalAddresses() : [];
+
+    private static bool CanBindLan(IEnumerable<IPAddress> addresses)
+    {
+        try
+        {
+            foreach (var address in addresses)
+            {
+                using var probe = new System.Net.Sockets.Socket(address.AddressFamily,
+                    System.Net.Sockets.SocketType.Stream, System.Net.Sockets.ProtocolType.Tcp);
+                probe.ExclusiveAddressUse = true;
+                probe.Bind(new IPEndPoint(address, LanPort));
+            }
+            return true;
+        }
+        catch (System.Net.Sockets.SocketException) { return false; }
+    }
 
     private void StopDiscovery()
     {
@@ -761,7 +776,7 @@ internal sealed partial class MainWindow : Window
 
     private async Task StartListener(IPAddress[] addresses)
     {
-        var listener = new AgentServer(store, platform, pairing, identity.HostId, new PowerShellTerminal());
+        var listener = new AgentServer(store, platform, pairing, identity.HostId, new PowerShellTerminal(), taskRunner: tasks);
         server = listener;
         listener.Diagnostic += text => Dispatcher.BeginInvoke(() => RecordDiagnostic(text));
         UpdateControlPause();
@@ -1106,6 +1121,7 @@ internal sealed partial class MainWindow : Window
         SystemEvents.SessionSwitch -= SessionChanged;
         SystemEvents.PowerModeChanged -= PowerChanged;
         await StopServer();
+        await tasks.DisposeAsync();
         platform.Dispose();
         identity.Dispose();
         store.Dispose();
