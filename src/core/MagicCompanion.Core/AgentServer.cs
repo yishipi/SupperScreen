@@ -270,6 +270,7 @@ public sealed class AgentServer : IAsyncDisposable
                         or OperationCanceledException
                         or JsonException
                         or IOException
+                        or ChannelClosedException
             )
         {
             Diagnostic?.Invoke("连接结束：" + ex.GetType().Name);
@@ -303,6 +304,7 @@ public sealed class AgentServer : IAsyncDisposable
             ? device
             : throw new AgentException("DEVICE_REVOKED", "电脑已解除配对");
 
+    // Store the outcome of each side effect before sending a response on the current link.
     private async Task ProcessAsync(
         Client client,
         JsonElement message,
@@ -357,7 +359,6 @@ public sealed class AgentServer : IAsyncDisposable
                 if (ControlPaused)
                     throw new AgentException("PERMISSION_DENIED", "电脑已暂停控制");
             }
-            object? result;
             var sideEffect =
                 action is "app.launch" or "task.run" or "media.command" or "todo.change" or "screen.capture";
             if (sideEffect)
@@ -380,10 +381,12 @@ public sealed class AgentServer : IAsyncDisposable
                     );
                 }
             }
+            string response;
+            var succeeded = false;
             try
             {
-                result = await DispatchAsync(client, device, action, payload);
-                var response = Wire.Serialize(
+                var result = await DispatchAsync(client, device, action, payload);
+                response = Wire.Serialize(
                     new
                     {
                         protocolVersion = 1,
@@ -393,9 +396,7 @@ public sealed class AgentServer : IAsyncDisposable
                         result,
                     }
                 );
-                if (sideEffect)
-                    store.CompleteRequest(device.DeviceId, requestId, "succeeded", response);
-                await client.Out.Writer.WriteAsync(response, cancellation);
+                succeeded = true;
             }
             catch (Exception ex)
                 when (ex
@@ -409,17 +410,17 @@ public sealed class AgentServer : IAsyncDisposable
                 var error =
                     ex as AgentException
                     ?? new AgentException("INTERNAL_ERROR", "操作未完成，请查看电脑诊断");
-                var response = ErrorResponse(requestId, error.Code, error.Message);
-                if (sideEffect)
-                    store.CompleteRequest(device.DeviceId, requestId, "failed", response);
-                await client.Out.Writer.WriteAsync(response, cancellation);
+                response = ErrorResponse(requestId, error.Code, error.Message);
             }
+            if (sideEffect)
+                store.CompleteRequest(device.DeviceId, requestId, succeeded ? "succeeded" : "failed", response);
+            await client.Out.Writer.WriteAsync(response, cancellation);
         }
         catch (Exception ex)
             when (ex
                     is AgentException
                         or KeyNotFoundException
-                        or InvalidOperationException
+                        or (InvalidOperationException and not ChannelClosedException)
                         or FormatException
             )
         {

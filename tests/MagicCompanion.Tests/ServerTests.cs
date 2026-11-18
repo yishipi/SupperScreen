@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
+using System.Threading.Channels;
 using MagicCompanion.Core;
 using Xunit;
 
@@ -13,6 +14,39 @@ namespace MagicCompanion.Tests;
 
 public sealed class ServerTests
 {
+    [Fact]
+    public async Task ClosedResponseQueuePreservesTheRecordedOperationResult()
+    {
+        using var store = new AgentStore(":memory:");
+        const string deviceId = "phone";
+        const string sessionId = "session";
+        store.SaveDevice(new(deviceId, "Phone", "test-key", ["todos.read", "todos.write"], false));
+        var item = Assert.Single(store.ChangeTodo("add", title: "Review fixture").Items);
+        await using var server = new AgentServer(store, new FakePlatform(), new(store, "host"), "host");
+        using var socket = new ClientWebSocket();
+        var clientType = typeof(AgentServer).GetNestedType("Client", BindingFlags.NonPublic)!;
+        var client = Activator.CreateInstance(clientType, socket, deviceId, sessionId, false)!;
+        var outgoing = (Channel<string>)clientType.GetField("Out")!.GetValue(client)!;
+        outgoing.Writer.Complete();
+        var requestId = Wire.NewId();
+        var request = JsonSerializer.SerializeToElement(new
+        {
+            protocolVersion = 1,
+            messageType = "request",
+            deviceId,
+            sessionId,
+            requestId,
+            action = "todo.change",
+            payload = new { operation = "setCompleted", id = item.Id, completed = true },
+        });
+        var process = typeof(AgentServer).GetMethod("ProcessAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        await Assert.ThrowsAsync<ChannelClosedException>(() => (Task)process.Invoke(server, [client, request, CancellationToken.None])!);
+        Assert.True(Assert.Single(store.Todos().Items).Completed);
+        var outcome = JsonSerializer.SerializeToElement(store.RequestStatus(deviceId, requestId), Wire.Json);
+        Assert.Equal("succeeded", outcome.GetProperty("state").GetString());
+        Assert.Equal("ok", outcome.GetProperty("result").GetProperty("status").GetString());
+    }
+
     [Fact]
     public void EventBackpressureAbortsTheLinkSoThePhoneCanResubscribe()
     {

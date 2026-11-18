@@ -589,7 +589,7 @@ internal sealed partial class MainWindow : Window
                 () =>
                     Try(() =>
                     {
-                        var tasks = TaskRunner.ParseTemplates(templates.Text);
+                        var tasks = TaskRunner.ParseTemplates(templates.Text, validatePatterns: true);
                         foreach (var t in tasks)
                         {
                             if (

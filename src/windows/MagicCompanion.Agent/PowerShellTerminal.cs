@@ -24,8 +24,7 @@ public sealed class PowerShellTerminal : ITerminalPlatform
             return new(Wire.NewId(), title, Path.Combine(Environment.SystemDirectory, "cmd.exe"), [], directory, BatchFile: path);
         if (!path.EndsWith(".ps1", StringComparison.OrdinalIgnoreCase))
             throw new AgentException("INVALID_ARGUMENT", "请选择 .ps1 或 .cmd 脚本");
-        // Windows PowerShell 5.1 otherwise uses the active legacy code page for redirected output.
-        var command = "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & '" + path.Replace("'", "''") + "'";
+        var command = TaskRunner.PowerShellScriptCommand(path);
         return new(Wire.NewId(), title, Executable,
             ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], directory);
     }

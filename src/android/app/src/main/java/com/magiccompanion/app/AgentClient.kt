@@ -148,6 +148,7 @@ private class TodoCache(context: Context) : SQLiteOpenHelper(context, "todo-cach
     }
 }
 
+// Keeps the selected connection, pairing attempt, and desktop state in sync.
 class AgentClient(application: Application) : AndroidViewModel(application) {
     private val prefs = application.getSharedPreferences("settings", Context.MODE_PRIVATE)
     private val cache = TodoCache(application)
@@ -183,11 +184,12 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
     private var pinnedClient: Pair<String, OkHttpClient>? = null
 
     private data class Pending(val link: Link, val completion: CompletableDeferred<JSONObject>)
-    private class RequestRejected(message: String) : java.io.IOException(message)
+    private class RequestRejected(val code: String, message: String) : java.io.IOException(message)
 
     private val pending = ConcurrentHashMap<String, Pending>()
     @Volatile private var selected: Link? = null
     @Volatile private var pairClaim: String? = null
+    private var pairingExpiry: Job? = null
     private var discovery: NsdManager.DiscoveryListener? = null
     private val nsd = application.getSystemService(Context.NSD_SERVICE) as NsdManager
     @Volatile private var running = true
@@ -211,7 +213,10 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
                 val link = selected ?: continue
                 if (!visible) continue
                 val permissions = mutable.value.permissions
-                if ("tasks.read" in permissions) refreshTemplates(link)
+                if ("tasks.read" in permissions) {
+                    refreshRunningJobs(link)
+                    refreshTemplates(link)
+                }
                 if (selected === link && link.supports("apps") && "app.launch" in permissions) refreshApps(link)
             }
         }
@@ -267,6 +272,7 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
         mutable.update { it.copy(error = message.take(300)) }
     }
 
+    @Synchronized
     fun pair(raw: String) {
         runCatching {
                 val host = JSONObject(raw)
@@ -276,10 +282,8 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
                 ) {
                     "二维码不是本应用的配对码"
                 }
-                require(
-                    java.time.Instant.parse(host.getString("expiresAt"))
-                        .isAfter(java.time.Instant.now())
-                ) {
+                val expiresAt = java.time.Instant.parse(host.getString("expiresAt"))
+                require(expiresAt.isAfter(java.time.Instant.now())) {
                     "二维码已过期，请在电脑重新生成"
                 }
                 require(host.getString("fingerprint").matches(Regex("sha256:[A-Za-z0-9_-]{43}"))) {
@@ -298,9 +302,21 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
                     notice = "连接电脑后，请在电脑确认配对",
                     bluetoothReady = bluetoothEnabled(getApplication()),
                 )
+                pairingExpiry = scope.launch {
+                    delay(java.time.Duration.between(java.time.Instant.now(), expiresAt).toMillis().coerceAtLeast(0))
+                    failPairing(host, "二维码已过期，请在电脑重新生成")
+                }
                 connectCandidates(host)
             }
             .onFailure { report(it.message ?: "二维码无效") }
+    }
+
+    @Synchronized
+    private fun failPairing(host: JSONObject, message: String) {
+        if (config !== host || !host.has("secret")) return
+        config = null
+        disconnect()
+        mutable.update { it.copy(pairingCode = "", notice = message, error = "") }
     }
 
     private fun validateUrl(url: String) {
@@ -380,11 +396,11 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
             var backoff = 1000L
             while (isActive && running && links[url] === link && config === host) {
                 val ended = CompletableDeferred<Boolean>()
-                open(link, host.getString("fingerprint"), ended)
+                open(link, host, ended)
                 val wasEstablished = ended.await()
                 if (links[url] !== link) break
                 synchronized(this@AgentClient) {
-                    if (pairClaim == url) pairClaim = null
+                    if (links[url] === link && pairClaim == url) pairClaim = null
                 }
                 if (wasEstablished) backoff = 1000
                 delay(backoff)
@@ -438,8 +454,11 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
             .also { pinnedClient = pin to it }
     }
 
-    private fun authentication(challenge: JSONObject, url: String, pairing: Boolean): JSONObject? {
-        val host = config ?: error("未配对")
+    @Synchronized
+    private fun authentication(challenge: JSONObject, link: Link, host: JSONObject): JSONObject? {
+        if (config !== host || links[link.url] !== link) return null
+        val pairing = host.has("secret")
+        if (pairing && pairClaim != null && pairClaim != link.url) return null
         require(
             challenge.getInt("protocolVersion") == 1 &&
                 challenge.getString("hostId") == host.getString("hostId")
@@ -460,56 +479,29 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
                     update(canonical)
                 }
                 .sign()
-        return json(
+        val response = json(
                 "type" to "authenticate",
                 "deviceId" to deviceId,
                 "publicKey" to b64(publicKey),
                 "signature" to b64(signature),
                 "deviceName" to "${Build.MANUFACTURER} ${Build.MODEL}",
             )
-            .apply {
-                if (pairing && host.has("secret"))
-                    synchronized(this@AgentClient) {
-                        if (pairClaim != null && pairClaim != url) return null
-                        run {
-                            pairClaim = url
-                            put("pairSessionId", host.getString("pairSessionId"))
-                            put(
-                                "pairProof",
-                                b64(
-                                    Mac.getInstance("HmacSHA256")
-                                        .apply {
-                                            init(
-                                                SecretKeySpec(
-                                                    Base64.decode(
-                                                        host.getString("secret"),
-                                                        Base64.DEFAULT,
-                                                    ),
-                                                    "HmacSHA256",
-                                                )
-                                            )
-                                        }
-                                        .doFinal(canonical)
-                                ),
-                            )
-                            mutable.update {
-                                it.copy(
-                                    pairingCode =
-                                        digest(canonical)
-                                            .joinToString("") { b ->
-                                                "%02X".format(b.toInt() and 255)
-                                            }
-                                            .take(6)
-                                )
-                            }
-                        }
-                    }
-            }
+        if (!pairing) return response
+        val secret = Base64.decode(host.getString("secret"), Base64.DEFAULT)
+        val proof = Mac.getInstance("HmacSHA256").apply {
+            init(SecretKeySpec(secret, "HmacSHA256"))
+        }.doFinal(canonical)
+        response.put("pairSessionId", host.getString("pairSessionId"))
+        response.put("pairProof", b64(proof))
+        pairClaim = link.url
+        val code = digest(canonical).take(3).joinToString("") { "%02X".format(it.toInt() and 255) }
+        mutable.update { it.copy(pairingCode = code) }
+        return response
     }
 
-    private fun open(link: Link, pin: String, ended: CompletableDeferred<Boolean>) {
+    private fun open(link: Link, host: JSONObject, ended: CompletableDeferred<Boolean>) {
         val client =
-            runCatching { httpClient(pin) }
+            runCatching { httpClient(host.getString("fingerprint")) }
                 .getOrElse {
                     ended.complete(false)
                     return
@@ -521,7 +513,7 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
                     private var authenticatedAt: Long? = null
 
                     override fun onMessage(webSocket: WebSocket, text: String) {
-                        if (links[link.url] !== link) return
+                        if (links[link.url] !== link || config !== host) return
                         if (text.toByteArray().size > 65536) {
                             webSocket.cancel()
                             return
@@ -530,42 +522,51 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
                                 val value = JSONObject(text)
                                 when (value.optString("type")) {
                                     "challenge" -> {
-                                        val auth = authentication(value, link.url, true)
+                                        val auth = authentication(value, link, host)
                                         if (auth == null) webSocket.cancel()
                                         else webSocket.send(auth.toString())
                                     }
                                     "authenticated" -> {
-                                        authenticatedAt = android.os.SystemClock.elapsedRealtime()
-                                        link.session = value.getString("sessionId")
-                                        val host = config ?: return
-                                        host.remove("secret")
-                                        host.remove("pairSessionId")
-                                        host.remove("expiresAt")
-                                        prefs.edit().putString("host", host.toString()).apply()
-                                        mutable.update {
-                                            it.copy(
-                                                paired = true,
-                                                host = value.optString("hostName"),
-                                                permissions =
-                                                    value
-                                                        .getJSONArray("permissions")
-                                                        .strings()
-                                                        .toSet(),
-                                                pairingCode = "",
-                                                notice = "",
-                                                error = "",
-                                            )
+                                        synchronized(this@AgentClient) {
+                                            if (config !== host || links[link.url] !== link) return
+                                            val permissions = value.getJSONArray("permissions").strings().toSet()
+                                            link.session = value.getString("sessionId")
+                                            authenticatedAt = android.os.SystemClock.elapsedRealtime()
+                                            pairingExpiry?.cancel()
+                                            pairingExpiry = null
+                                            host.remove("secret")
+                                            host.remove("pairSessionId")
+                                            host.remove("expiresAt")
+                                            prefs.edit().putString("host", host.toString()).apply()
+                                            mutable.update {
+                                                it.copy(
+                                                    paired = true,
+                                                    host = value.optString("hostName"),
+                                                    permissions = permissions,
+                                                    pairingCode = "",
+                                                    notice = "",
+                                                    error = "",
+                                                )
+                                            }
+                                            startDiscovery()
+                                            chooseLink()
                                         }
-                                        startDiscovery()
-                                        chooseLink()
                                         scope.launch {
                                             learnBluetoothAddress(link, host)
                                         }
                                     }
                                     "auth.error" -> {
-                                        if (value.optString("code") == "DEVICE_REVOKED") forget()
-                                        else if (!mutable.value.online && (pairClaim == null || pairClaim == link.url))
-                                            report(value.optString("message"))
+                                        synchronized(this@AgentClient) {
+                                            if (config !== host || links[link.url] !== link) return
+                                            val message = value.optString("message")
+                                            if (host.has("secret")) {
+                                                if (pairClaim == link.url) failPairing(host, message)
+                                            } else if (value.optString("code") == "DEVICE_REVOKED") {
+                                                forget()
+                                            } else if (!mutable.value.online) {
+                                                report(message)
+                                            }
+                                        }
                                         webSocket.close(1008, "认证结束")
                                     }
                                     else ->
@@ -683,8 +684,10 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
             if (!sent) throw java.io.IOException("请求未发送")
             val response = withTimeoutOrNull(timeout) { answer.await() }
                 ?: throw java.io.IOException("电脑响应超时，请检查连接")
-            if (response.getString("status") != "ok")
-                throw RequestRejected(response.getJSONObject("error").getString("message"))
+            if (response.getString("status") != "ok") {
+                val error = response.getJSONObject("error")
+                throw RequestRejected(error.optString("code"), error.getString("message"))
+            }
             return response
         } finally {
             pending.remove(id)
@@ -925,6 +928,35 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
                         }
                 }
             }
+    }
+
+    // Completion events can be missed while the phone has no active connection.
+    private suspend fun refreshRunningJobs(link: Link) {
+        val socket = link.socket ?: return
+        fun isCurrent() = selected === link && link.socket === socket && link.session != null &&
+            "tasks.read" in mutable.value.permissions
+        val runningJobs = mutable.value.jobs.values.filter { it.optString("state") == "running" }
+        for (job in runningJobs) {
+            if (!isCurrent()) return
+            val jobId = job.getString("jobId")
+            try {
+                val result = requestOn(link, "task.status.get", json("jobId" to jobId)).getJSONObject("result")
+                if (isCurrent()) applyJob(result)
+            } catch (ex: RequestRejected) {
+                if (ex.code == "INVALID_ARGUMENT" && isCurrent()) {
+                    val templateId = job.getString("templateId")
+                    val unknown = JSONObject(job.toString()).put("state", "unknown")
+                    mutable.update { state ->
+                        val current = state.jobs[templateId]
+                        if (current?.optString("jobId") == jobId && current.optString("state") == "running")
+                            state.copy(jobs = state.jobs + (templateId to unknown))
+                        else state
+                    }
+                }
+            } catch (_: java.io.IOException) {
+                return
+            }
+        }
     }
 
     private suspend fun refreshTemplates(link: Link) {
@@ -1200,6 +1232,8 @@ class AgentClient(application: Application) : AndroidViewModel(application) {
 
     @Synchronized
     private fun disconnect() {
+        pairingExpiry?.cancel()
+        pairingExpiry = null
         stopBluetooth()
         discovery?.let { runCatching { nsd.stopServiceDiscovery(it) } }
         discovery = null

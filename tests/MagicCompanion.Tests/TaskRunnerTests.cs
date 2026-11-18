@@ -6,6 +6,19 @@ namespace MagicCompanion.Tests;
 
 public sealed class TaskRunnerTests
 {
+    [Fact]
+    public void SavingInvalidParameterRegexIdentifiesTheTaskAndParameter()
+    {
+        var template = new TaskTemplate("check", "Example Task", "unused", [], "unused",
+            ParameterPatterns: new() { ["target"] = "[" });
+        var json = Wire.Serialize(new[] { template });
+        Assert.Single(TaskRunner.ParseTemplates(json));
+        var error = Assert.Throws<AgentException>(() => TaskRunner.ParseTemplates(json, validatePatterns: true));
+        Assert.Equal("INVALID_ARGUMENT", error.Code);
+        Assert.Contains(template.Name, error.Message);
+        Assert.Contains("target", error.Message);
+    }
+
     [Theory]
     [InlineData("[null]")]
     [InlineData("[{\"executable\":\"unused\",\"workingDirectory\":\"unused\"}]")]

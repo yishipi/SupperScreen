@@ -146,6 +146,19 @@ try
     if (result.State != "succeeded" || !result.Lines.Contains("脚本成功"))
         throw new Exception("Script failed: " + string.Join("\n", result.Lines));
     Console.WriteLine("PASS: configured PowerShell script, spaces/quotes in path, Chinese output, exit status");
+    await File.WriteAllTextAsync(path, "exit 7", new UTF8Encoding(true));
+    var legacyCommand = "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & '" + path.Replace("'", "''") + "'";
+    var legacyScript = script with { Id = Wire.NewId(), Arguments = [..script.Arguments[..^1], legacyCommand] };
+    store.SetSetting("taskTemplates", Wire.Serialize(new[] { script, legacyScript }));
+    foreach (var configured in new[] { script, legacyScript })
+    {
+        job = runner.Start("phone", configured.Id, default);
+        while (runner.Get("phone", job.JobId).State == "running") await Task.Delay(100, timeout.Token);
+        result = runner.Get("phone", job.JobId);
+        if (result.State != "failed" || result.ExitCode != 7)
+            throw new Exception($"PowerShell exit code mismatch: {result.State}, {result.ExitCode}");
+    }
+    Console.WriteLine("PASS: new and existing PowerShell scripts preserve their nonzero exit code");
     var batchPath = Path.Combine(temporary, "带 空格 & %PATH% !.cmd");
     await File.WriteAllTextAsync(batchPath, "@echo off\r\necho 脚本输出\r\n1>&2 echo STDERR-LINE\r\nexit /b 7\r\n", new UTF8Encoding(false));
     var batch = PowerShellTerminal.Script("测试 CMD", batchPath) with { AllowWhileLocked = true };

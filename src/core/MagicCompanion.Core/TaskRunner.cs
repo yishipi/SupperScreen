@@ -7,6 +7,13 @@ namespace MagicCompanion.Core;
 
 public sealed class TaskRunner(AgentStore store) : IDisposable, IAsyncDisposable
 {
+    private const string PowerShellScriptPrefix = "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & '";
+    private const string PowerShellExit = "; if ($?) { exit 0 }; if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1";
+
+    // Build the UTF-8 wrapper for the configured script, preserving its process exit code.
+    public static string PowerShellScriptCommand(string path) =>
+        PowerShellScriptPrefix + path.Replace("'", "''") + "'" + PowerShellExit;
+
     private sealed class Running(TaskJob snapshot, string owner)
     {
         public TaskJob Snapshot = snapshot;
@@ -26,7 +33,8 @@ public sealed class TaskRunner(AgentStore store) : IDisposable, IAsyncDisposable
     public event Action<string, TaskJob>? Changed;
     public TaskTemplate[] Templates => ParseTemplates(store.GetSetting("taskTemplates") ?? "[]");
 
-    public static TaskTemplate[] ParseTemplates(string json)
+    // Validate every parameter rule when saving the catalog. Older catalogs can still be opened for editing.
+    public static TaskTemplate[] ParseTemplates(string json, bool validatePatterns = false)
     {
         TaskTemplate[] templates;
         try { templates = JsonSerializer.Deserialize<TaskTemplate[]>(json, Wire.Json) ?? []; }
@@ -39,8 +47,25 @@ public sealed class TaskRunner(AgentStore store) : IDisposable, IAsyncDisposable
             throw new AgentException("INVALID_ARGUMENT", "每个任务需填写有效的 id、name 和 arguments");
         if (templates.Select(t => t.Id).Distinct(StringComparer.Ordinal).Count() != templates.Length)
             throw new AgentException("INVALID_ARGUMENT", "任务 id 不能重复");
+        if (validatePatterns)
+            foreach (var template in templates)
+                foreach (var (name, pattern) in template.ParameterPatterns ?? [])
+                    ParameterRegex(template, name, pattern);
         return templates;
     }
+
+    private static Regex ParameterRegex(TaskTemplate template, string name, string pattern)
+    {
+        try
+        {
+            return new Regex("\\A(?:" + pattern + ")\\z", RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(100));
+        }
+        catch (RegexParseException)
+        {
+            throw new AgentException("INVALID_ARGUMENT", $"任务「{template.Name}」的参数「{name}」正则表达式无效");
+        }
+    }
+
     public TaskJob Start(string deviceId, string templateId, JsonElement parameters, bool locked = false)
     {
         lock (startGate)
@@ -76,16 +101,15 @@ public sealed class TaskRunner(AgentStore store) : IDisposable, IAsyncDisposable
                 )
                     throw new AgentException("INVALID_ARGUMENT", "任务参数未被允许");
                 var text = parameter.Value.GetString()!;
-                if (
-                    text.Length > 256
-                    || !Regex.IsMatch(
-                        text,
-                        "\\A(?:" + pattern + ")\\z",
-                        RegexOptions.CultureInvariant,
-                        TimeSpan.FromMilliseconds(100)
-                    )
-                )
-                    throw new AgentException("INVALID_ARGUMENT", "任务参数不符合允许格式");
+                try
+                {
+                    if (text.Length > 256 || !ParameterRegex(template, parameter.Name, pattern).IsMatch(text))
+                        throw new AgentException("INVALID_ARGUMENT", "任务参数不符合允许格式");
+                }
+                catch (RegexMatchTimeoutException)
+                {
+                    throw new AgentException("INVALID_ARGUMENT", $"任务「{template.Name}」的参数「{parameter.Name}」校验超时");
+                }
                 values[parameter.Name] = text;
             }
         foreach (var key in patterns.Keys)
@@ -112,7 +136,7 @@ public sealed class TaskRunner(AgentStore store) : IDisposable, IAsyncDisposable
         }
         else
         {
-            foreach (var argument in template.Arguments)
+            foreach (var argument in ScriptArguments(template))
             {
                 var expanded = argument;
                 foreach (var (key, value) in values)
@@ -134,6 +158,20 @@ public sealed class TaskRunner(AgentStore store) : IDisposable, IAsyncDisposable
         PruneHistory();
         running.Completion = ExecuteAsync(info, running);
         return job;
+    }
+
+    private static string[] ScriptArguments(TaskTemplate template)
+    {
+        var arguments = template.Arguments;
+        if (Path.GetFileName(template.Executable).ToLowerInvariant() is not ("powershell.exe" or "pwsh.exe")
+            || arguments is not ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", var command]
+            || !command.StartsWith(PowerShellScriptPrefix, StringComparison.Ordinal)
+            || command.Length <= PowerShellScriptPrefix.Length || !command.EndsWith('\'')
+            || command[PowerShellScriptPrefix.Length..^1].Replace("''", "").Contains('\''))
+            return arguments;
+
+        // Earlier versions stored this exact wrapper in the task template.
+        return [..arguments[..^1], command + PowerShellExit];
     }
 
     private async Task ExecuteAsync(ProcessStartInfo info, Running job)
